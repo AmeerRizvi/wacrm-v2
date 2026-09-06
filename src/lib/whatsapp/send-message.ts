@@ -8,7 +8,7 @@
 //   2. loads the conversation + contact + WhatsApp channel,
 //   3. sends to Meta (with phone-variant retry + contact auto-fix),
 //   4. persists the message + updates the conversation,
-//   5. pauses any active Flow run for the contact (agent stepped in).
+//   5. pauses any active Flow run for this conversation.
 // ============================================================
 
 import type { SupabaseClient } from '@supabase/supabase-js';
@@ -68,19 +68,14 @@ export interface SendMessageParams {
   filename?: string | null;
   templateName?: string | null;
   templateLanguage?: string | null;
-  /** Legacy positional body params (only used if messageParams.body unset). */
   templateParams?: string[];
-  /** Structured template params (header/body/buttons). */
   templateMessageParams?: unknown;
-  /** Structured payload for `messageType === 'interactive'`. */
   interactivePayload?: InteractiveMessagePayload | null;
   replyToMessageId?: string | null;
 }
 
 export interface SendMessageResult {
-  /** Our `messages.id` (the persisted row). */
   messageId: string;
-  /** Meta's `wamid` for the delivered message. */
   whatsappMessageId: string;
 }
 
@@ -91,65 +86,33 @@ export function validateSendMessageParams(params: {
   templateName?: string | null;
   interactivePayload?: InteractiveMessagePayload | null;
 }): void {
-  const { messageType, contentText, mediaUrl, templateName, interactivePayload } =
-    params;
-
-  if (!messageType) {
-    throw new SendMessageError('bad_request', 'message_type is required', 400);
-  }
+  const { messageType, contentText, mediaUrl, templateName, interactivePayload } = params;
+  if (!messageType) throw new SendMessageError('bad_request', 'message_type is required', 400);
 
   const isMediaKind = (MEDIA_KINDS as readonly string[]).includes(messageType);
-
   if (!(VALID_MESSAGE_TYPES as readonly string[]).includes(messageType)) {
-    throw new SendMessageError(
-      'bad_request',
-      `Unsupported message_type "${messageType}"`,
-      400
-    );
+    throw new SendMessageError('bad_request', `Unsupported message_type "${messageType}"`, 400);
   }
-
   if (messageType === 'text' && !contentText) {
-    throw new SendMessageError(
-      'bad_request',
-      'content_text is required for text messages',
-      400
-    );
+    throw new SendMessageError('bad_request', 'content_text is required for text messages', 400);
   }
-
   if (messageType === 'template' && !templateName) {
-    throw new SendMessageError(
-      'bad_request',
-      'template_name is required for template messages',
-      400
-    );
+    throw new SendMessageError('bad_request', 'template_name is required for template messages', 400);
   }
-
   if (messageType === 'interactive') {
     const result = validateInteractivePayload(interactivePayload);
-    if (!result.ok) {
-      throw new SendMessageError('bad_request', result.error, 400);
-    }
+    if (!result.ok) throw new SendMessageError('bad_request', result.error, 400);
   }
-
   if (isMediaKind && !mediaUrl) {
-    throw new SendMessageError(
-      'bad_request',
-      `media_url is required for ${messageType} messages`,
-      400
-    );
+    throw new SendMessageError('bad_request', `media_url is required for ${messageType} messages`, 400);
   }
-
   if (
     isMediaKind &&
     messageType !== 'audio' &&
     typeof contentText === 'string' &&
     contentText.length > 1024
   ) {
-    throw new SendMessageError(
-      'bad_request',
-      'Caption exceeds the 1024-character limit',
-      400
-    );
+    throw new SendMessageError('bad_request', 'Caption exceeds the 1024-character limit', 400);
   }
 }
 
@@ -173,26 +136,12 @@ export async function sendMessageToConversation(
   } = params;
 
   if (!conversationId) {
-    throw new SendMessageError(
-      'bad_request',
-      'conversation_id is required',
-      400
-    );
+    throw new SendMessageError('bad_request', 'conversation_id is required', 400);
   }
 
-  validateSendMessageParams({
-    messageType,
-    contentText,
-    mediaUrl,
-    templateName,
-    interactivePayload,
-  });
-
+  validateSendMessageParams({ messageType, contentText, mediaUrl, templateName, interactivePayload });
   const isMediaKind = (MEDIA_KINDS as readonly string[]).includes(messageType);
 
-  // Conversation + contact, account-scoped. The conversation owns channel
-  // selection: replies must always leave through the same WhatsApp number
-  // that owns the thread.
   const { data: conversation, error: convError } = await db
     .from('conversations')
     .select('*, contact:contacts(*)')
@@ -206,24 +155,14 @@ export async function sendMessageToConversation(
 
   const contact = conversation.contact;
   if (!contact?.phone) {
-    throw new SendMessageError(
-      'bad_request',
-      'Contact phone number not found',
-      400
-    );
+    throw new SendMessageError('bad_request', 'Contact phone number not found', 400);
   }
 
   const sanitizedPhone = sanitizePhoneForMeta(contact.phone);
   if (!isValidE164(sanitizedPhone)) {
-    throw new SendMessageError(
-      'bad_request',
-      'Invalid phone number format',
-      400
-    );
+    throw new SendMessageError('bad_request', 'Invalid phone number format', 400);
   }
 
-  // Resolve the exact channel bound to the conversation. Legacy rows that
-  // have not been backfilled yet fall back to the account's primary channel.
   let config: Record<string, any> | null = null;
   let configError: { message?: string } | null = null;
 
@@ -256,19 +195,13 @@ export async function sendMessageToConversation(
   }
 
   const accessToken = decrypt(config.access_token);
-
   if (isLegacyFormat(config.access_token)) {
     void db
       .from('whatsapp_config')
       .update({ access_token: encrypt(accessToken) })
       .eq('id', config.id)
       .then(({ error }: { error: { message: string } | null }) => {
-        if (error) {
-          console.warn(
-            '[send-message] access_token GCM upgrade failed:',
-            error.message
-          );
-        }
+        if (error) console.warn('[send-message] access_token GCM upgrade failed:', error.message);
       });
   }
 
@@ -280,21 +213,10 @@ export async function sendMessageToConversation(
       .eq('id', replyToMessageId)
       .eq('conversation_id', conversationId)
       .maybeSingle();
-
     if (parentError || !parent) {
-      throw new SendMessageError(
-        'bad_request',
-        'reply_to_message_id not found in this conversation',
-        400
-      );
+      throw new SendMessageError('bad_request', 'reply_to_message_id not found in this conversation', 400);
     }
-    if (!parent.message_id) {
-      console.warn(
-        '[send-message] reply target has no Meta message_id; sending without context'
-      );
-    } else {
-      contextMessageId = parent.message_id;
-    }
+    if (parent.message_id) contextMessageId = parent.message_id;
   }
 
   let templateRow: MessageTemplate | null = null;
@@ -304,12 +226,13 @@ export async function sendMessageToConversation(
       db,
       accountId,
       templateName,
-      templateLanguage
+      templateLanguage,
+      config.id,
     );
     if (resolved.malformed) {
       throw new SendMessageError(
         'template_malformed',
-        'Template row is malformed locally — run "Sync from Meta" in Settings to repair it.',
+        'Template row is malformed locally — sync this WhatsApp channel from Meta to repair it.',
         500
       );
     }
@@ -386,10 +309,8 @@ export async function sendMessageToConversation(
   let waMessageId = '';
   let workingPhone = sanitizedPhone;
   try {
-    const variants = phoneVariants(sanitizedPhone);
     let lastError: unknown = null;
-
-    for (const variant of variants) {
+    for (const variant of phoneVariants(sanitizedPhone)) {
       try {
         waMessageId = await attempt(variant);
         workingPhone = variant;
@@ -397,32 +318,18 @@ export async function sendMessageToConversation(
         break;
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        if (!isRecipientNotAllowedError(message)) {
-          throw err;
-        }
+        if (!isRecipientNotAllowedError(message)) throw err;
         lastError = err;
-        console.warn(
-          `[send-message] variant "${variant}" rejected by Meta, trying next…`
-        );
       }
     }
-
     if (lastError) throw lastError;
   } catch (err) {
-    const message =
-      err instanceof Error ? err.message : 'Unknown Meta API error';
-    console.error('[send-message] Meta send failed for all variants:', message);
+    const message = err instanceof Error ? err.message : 'Unknown Meta API error';
     throw new SendMessageError('meta_error', `Meta API error: ${message}`, 502);
   }
 
   if (workingPhone !== sanitizedPhone) {
-    console.log(
-      `[send-message] Auto-corrected contact phone: ${sanitizedPhone} → ${workingPhone}`
-    );
-    await db
-      .from('contacts')
-      .update({ phone: workingPhone })
-      .eq('id', contact.id);
+    await db.from('contacts').update({ phone: workingPhone }).eq('id', contact.id);
   }
 
   const persistedText =
@@ -446,8 +353,7 @@ export async function sendMessageToConversation(
       content_text: persistedText,
       media_url: mediaUrl || null,
       template_name: templateName || null,
-      interactive_payload:
-        messageType === 'interactive' ? interactivePayload : null,
+      interactive_payload: messageType === 'interactive' ? interactivePayload : null,
       message_id: waMessageId,
       status: 'sent',
       reply_to_message_id: replyToMessageId || null,
@@ -456,7 +362,6 @@ export async function sendMessageToConversation(
     .single();
 
   if (msgError) {
-    console.error('[send-message] error inserting sent message:', msgError);
     throw new SendMessageError(
       'db_error',
       `Message sent to Meta but failed to save to DB: ${msgError.message}`,
@@ -487,16 +392,11 @@ export async function sendMessageToConversation(
         end_reason: 'agent_replied',
       })
       .eq('account_id', accountId)
-      .eq('contact_id', contact.id)
+      .eq('conversation_id', conversationId)
       .eq('status', 'active');
-    if (pauseErr) {
-      console.error('[flows] pause-on-agent-send failed:', pauseErr.message);
-    }
+    if (pauseErr) console.error('[flows] pause-on-agent-send failed:', pauseErr.message);
   } catch (err) {
-    console.error(
-      '[flows] pause-on-agent-send threw:',
-      err instanceof Error ? err.message : err
-    );
+    console.error('[flows] pause-on-agent-send threw:', err instanceof Error ? err.message : err);
   }
 
   return { messageId: messageRecord.id, whatsappMessageId: waMessageId };
