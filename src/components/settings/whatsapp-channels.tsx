@@ -11,6 +11,8 @@ type Channel = {
   is_primary: boolean
   connected_at: string | null
   registered_at: string | null
+  subscribed_apps_at: string | null
+  last_registration_error: string | null
   mirror_inbound_media: boolean
 }
 
@@ -60,7 +62,9 @@ export function WhatsAppChannels() {
     }
   }, [])
 
-  useEffect(() => { void load() }, [load])
+  useEffect(() => {
+    void load()
+  }, [load])
 
   const edit = (channel: Channel) => {
     setNotice(null)
@@ -88,7 +92,11 @@ export function WhatsAppChannels() {
       })
       const json = await res.json()
       if (!res.ok) throw new Error(json.error || 'Failed to save WhatsApp channel')
-      setNotice(json.registration_error ? `Saved, but registration failed: ${json.registration_error}` : 'WhatsApp channel saved.')
+      setNotice(
+        json.registration_error
+          ? `Saved, but registration failed: ${json.registration_error}`
+          : 'WhatsApp channel saved.',
+      )
       setForm(EMPTY)
       await load()
     } catch (e) {
@@ -114,25 +122,45 @@ export function WhatsAppChannels() {
     setNotice(null)
     setError(null)
     try {
-      const res = await fetch(`/api/whatsapp/config?id=${encodeURIComponent(id)}`, { cache: 'no-store' })
+      const res = await fetch(`/api/whatsapp/config?id=${encodeURIComponent(id)}`, {
+        cache: 'no-store',
+      })
       const json = await res.json()
-      if (!res.ok || !json.connected) throw new Error(json.message || json.error || 'Connection test failed')
-      setNotice(`Connection verified${json.phone_info?.display_phone_number ? `: ${json.phone_info.display_phone_number}` : ''}.`)
-    } catch (e) { setError(e instanceof Error ? e.message : 'Connection test failed') }
+      if (!res.ok || !json.connected) {
+        throw new Error(json.message || json.error || 'Connection test failed')
+      }
+      setNotice(
+        `Connection verified${
+          json.phone_info?.display_phone_number ? `: ${json.phone_info.display_phone_number}` : ''
+        }.`,
+      )
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Connection test failed')
+    }
   }
 
   const remove = async (channel: Channel) => {
-    if (!window.confirm(`Remove ${channel.label || channel.phone_number_id}? Existing channel history must be moved or deleted first.`)) return
+    if (
+      !window.confirm(
+        `Remove ${channel.label || channel.phone_number_id}? Channels with retained conversation, message, broadcast, or template history cannot be removed.`,
+      )
+    ) {
+      return
+    }
     setError(null)
     setNotice(null)
     try {
-      const res = await fetch(`/api/whatsapp/config?id=${encodeURIComponent(channel.id)}`, { method: 'DELETE' })
+      const res = await fetch(`/api/whatsapp/config?id=${encodeURIComponent(channel.id)}`, {
+        method: 'DELETE',
+      })
       const json = await res.json()
       if (!res.ok) throw new Error(json.error || 'Failed to remove channel')
       if (form.id === channel.id) setForm(EMPTY)
       setNotice('WhatsApp channel removed.')
       await load()
-    } catch (e) { setError(e instanceof Error ? e.message : 'Failed to remove channel') }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to remove channel')
+    }
   }
 
   return (
@@ -140,56 +168,191 @@ export function WhatsAppChannels() {
       <div>
         <h2 className="text-lg font-semibold text-foreground">WhatsApp channels</h2>
         <p className="mt-1 text-sm text-muted-foreground">
-          Connect multiple WhatsApp Business numbers to this workspace. Each conversation stays permanently bound to the number that received it.
+          Connect multiple WhatsApp Business numbers to this workspace. Each conversation stays
+          permanently bound to the number that received it.
         </p>
       </div>
 
-      {notice && <div className="rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-700 dark:text-emerald-300">{notice}</div>}
-      {error && <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</div>}
+      {notice && (
+        <div className="rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-700 dark:text-emerald-300">
+          {notice}
+        </div>
+      )}
+      {error && (
+        <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          {error}
+        </div>
+      )}
 
       <div className="grid gap-3">
-        {loading ? <p className="text-sm text-muted-foreground">Loading channels…</p> : channels.length === 0 ? (
-          <div className="rounded-lg border border-dashed p-5 text-sm text-muted-foreground">No WhatsApp numbers connected yet.</div>
-        ) : channels.map((channel) => (
-          <div key={channel.id} className="flex flex-col gap-3 rounded-lg border bg-card p-4 md:flex-row md:items-center md:justify-between">
-            <div className="min-w-0">
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="font-medium text-foreground">{channel.label || channel.phone_number_id}</span>
-                {channel.is_primary && <span className="rounded-full bg-primary/10 px-2 py-0.5 text-xs font-medium text-primary">Primary</span>}
-                <span className="rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground">{channel.status}</span>
-              </div>
-              <p className="mt-1 text-xs text-muted-foreground">Phone number ID: {channel.phone_number_id}{channel.waba_id ? ` · WABA: ${channel.waba_id}` : ''}</p>
-            </div>
-            <div className="flex flex-wrap gap-2">
-              <button className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted" onClick={() => void test(channel.id)}>Test</button>
-              <button className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted" onClick={() => edit(channel)}>Edit</button>
-              {!channel.is_primary && <button className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted" onClick={() => void patch(channel.id, { is_primary: true }).catch((e) => setError(e.message))}>Make primary</button>}
-              <button className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted" onClick={() => void patch(channel.id, { mirror_inbound_media: !channel.mirror_inbound_media }).catch((e) => setError(e.message))}>{channel.mirror_inbound_media ? 'Media mirror on' : 'Media mirror off'}</button>
-              <button className="rounded-md border border-destructive/30 px-3 py-1.5 text-sm text-destructive hover:bg-destructive/10" onClick={() => void remove(channel)}>Remove</button>
-            </div>
+        {loading ? (
+          <p className="text-sm text-muted-foreground">Loading channels…</p>
+        ) : channels.length === 0 ? (
+          <div className="rounded-lg border border-dashed p-5 text-sm text-muted-foreground">
+            No WhatsApp numbers connected yet.
           </div>
-        ))}
+        ) : (
+          channels.map((channel) => (
+            <div
+              key={channel.id}
+              className="flex flex-col gap-3 rounded-lg border bg-card p-4 md:flex-row md:items-center md:justify-between"
+            >
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-medium text-foreground">
+                    {channel.label || channel.phone_number_id}
+                  </span>
+                  {channel.is_primary && (
+                    <span className="rounded-full bg-primary/10 px-2 py-0.5 text-xs font-medium text-primary">
+                      Primary
+                    </span>
+                  )}
+                  <span className="rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground">
+                    {channel.status}
+                  </span>
+                  {!channel.registered_at && (
+                    <span className="rounded-full bg-amber-500/10 px-2 py-0.5 text-xs text-amber-600 dark:text-amber-300">
+                      Registration pending
+                    </span>
+                  )}
+                  {channel.waba_id && !channel.subscribed_apps_at && (
+                    <span className="rounded-full bg-amber-500/10 px-2 py-0.5 text-xs text-amber-600 dark:text-amber-300">
+                      WABA subscription unconfirmed
+                    </span>
+                  )}
+                </div>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Phone number ID: {channel.phone_number_id}
+                  {channel.waba_id ? ` · WABA: ${channel.waba_id}` : ''}
+                </p>
+                {channel.last_registration_error && (
+                  <p className="mt-1 text-xs text-destructive">
+                    Registration: {channel.last_registration_error}
+                  </p>
+                )}
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+                  onClick={() => void test(channel.id)}
+                >
+                  Test
+                </button>
+                <button
+                  className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+                  onClick={() => edit(channel)}
+                >
+                  Edit
+                </button>
+                {!channel.is_primary && (
+                  <button
+                    className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+                    onClick={() =>
+                      void patch(channel.id, { is_primary: true }).catch((e) =>
+                        setError(e instanceof Error ? e.message : 'Failed to set primary'),
+                      )
+                    }
+                  >
+                    Make primary
+                  </button>
+                )}
+                <button
+                  className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+                  onClick={() =>
+                    void patch(channel.id, {
+                      mirror_inbound_media: !channel.mirror_inbound_media,
+                    }).catch((e) =>
+                      setError(e instanceof Error ? e.message : 'Failed to update media mirroring'),
+                    )
+                  }
+                >
+                  {channel.mirror_inbound_media ? 'Media mirror on' : 'Media mirror off'}
+                </button>
+                <button
+                  className="rounded-md border border-destructive/30 px-3 py-1.5 text-sm text-destructive hover:bg-destructive/10"
+                  onClick={() => void remove(channel)}
+                >
+                  Remove
+                </button>
+              </div>
+            </div>
+          ))
+        )}
       </div>
 
       <div className="rounded-lg border bg-card p-5">
         <div className="mb-4 flex items-center justify-between gap-4">
           <div>
-            <h3 className="font-medium text-foreground">{selected ? `Edit ${selected.label || selected.phone_number_id}` : 'Add WhatsApp number'}</h3>
-            <p className="text-xs text-muted-foreground">Tokens are encrypted at rest. Leave token fields blank while editing to keep the saved values.</p>
+            <h3 className="font-medium text-foreground">
+              {selected
+                ? `Edit ${selected.label || selected.phone_number_id}`
+                : 'Add WhatsApp number'}
+            </h3>
+            <p className="text-xs text-muted-foreground">
+              Tokens are encrypted at rest. Leave token fields blank while editing to keep the
+              saved values.
+            </p>
           </div>
-          {selected && <button className="text-sm text-muted-foreground hover:text-foreground" onClick={() => setForm(EMPTY)}>Cancel edit</button>}
+          {selected && (
+            <button
+              className="text-sm text-muted-foreground hover:text-foreground"
+              onClick={() => setForm(EMPTY)}
+            >
+              Cancel edit
+            </button>
+          )}
         </div>
 
         <div className="grid gap-4 md:grid-cols-2">
-          <Field label="Channel name" value={form.label} placeholder="Sales UAE" onChange={(value) => setForm((f) => ({ ...f, label: value }))} />
-          <Field label="Phone Number ID" value={form.phone_number_id} onChange={(value) => setForm((f) => ({ ...f, phone_number_id: value }))} />
-          <Field label="WABA ID" value={form.waba_id} onChange={(value) => setForm((f) => ({ ...f, waba_id: value }))} />
-          <Field label={selected ? 'Access token (leave blank to keep)' : 'Access token'} type="password" value={form.access_token} onChange={(value) => setForm((f) => ({ ...f, access_token: value }))} />
-          <Field label={selected ? 'Verify token (leave blank to keep)' : 'Verify token'} type="password" value={form.verify_token} onChange={(value) => setForm((f) => ({ ...f, verify_token: value }))} />
-          <Field label="6-digit registration PIN (optional)" type="password" value={form.pin} onChange={(value) => setForm((f) => ({ ...f, pin: value.replace(/\D/g, '').slice(0, 6) }))} />
+          <Field
+            label="Channel name"
+            value={form.label}
+            placeholder="Sales UAE"
+            onChange={(value) => setForm((f) => ({ ...f, label: value }))}
+          />
+          <Field
+            label="Phone Number ID"
+            value={form.phone_number_id}
+            disabled={Boolean(selected)}
+            hint={
+              selected
+                ? 'Channel identity is permanent. Add a new channel to connect a different number.'
+                : undefined
+            }
+            onChange={(value) => setForm((f) => ({ ...f, phone_number_id: value }))}
+          />
+          <Field
+            label="WABA ID"
+            value={form.waba_id}
+            onChange={(value) => setForm((f) => ({ ...f, waba_id: value }))}
+          />
+          <Field
+            label={selected ? 'Access token (leave blank to keep)' : 'Access token'}
+            type="password"
+            value={form.access_token}
+            onChange={(value) => setForm((f) => ({ ...f, access_token: value }))}
+          />
+          <Field
+            label={selected ? 'Verify token (leave blank to keep)' : 'Verify token'}
+            type="password"
+            value={form.verify_token}
+            onChange={(value) => setForm((f) => ({ ...f, verify_token: value }))}
+          />
+          <Field
+            label="6-digit registration PIN (optional)"
+            type="password"
+            value={form.pin}
+            onChange={(value) =>
+              setForm((f) => ({ ...f, pin: value.replace(/\D/g, '').slice(0, 6) }))
+            }
+          />
         </div>
 
-        <button disabled={saving || !form.phone_number_id || (!selected && !form.access_token)} onClick={() => void save()} className="mt-5 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground disabled:cursor-not-allowed disabled:opacity-50">
+        <button
+          disabled={saving || !form.phone_number_id || (!selected && !form.access_token)}
+          onClick={() => void save()}
+          className="mt-5 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground disabled:cursor-not-allowed disabled:opacity-50"
+        >
           {saving ? 'Saving…' : selected ? 'Update channel' : 'Add channel'}
         </button>
       </div>
@@ -197,11 +360,35 @@ export function WhatsAppChannels() {
   )
 }
 
-function Field({ label, value, onChange, placeholder, type = 'text' }: { label: string; value: string; onChange: (value: string) => void; placeholder?: string; type?: string }) {
+function Field({
+  label,
+  value,
+  onChange,
+  placeholder,
+  type = 'text',
+  disabled = false,
+  hint,
+}: {
+  label: string
+  value: string
+  onChange: (value: string) => void
+  placeholder?: string
+  type?: string
+  disabled?: boolean
+  hint?: string
+}) {
   return (
     <label className="grid gap-1.5 text-sm">
       <span className="font-medium text-foreground">{label}</span>
-      <input type={type} value={value} placeholder={placeholder} onChange={(e) => onChange(e.target.value)} className="h-10 rounded-md border bg-background px-3 text-foreground outline-none focus:ring-2 focus:ring-ring" />
+      <input
+        type={type}
+        value={value}
+        placeholder={placeholder}
+        disabled={disabled}
+        onChange={(e) => onChange(e.target.value)}
+        className="h-10 rounded-md border bg-background px-3 text-foreground outline-none focus:ring-2 focus:ring-ring disabled:cursor-not-allowed disabled:opacity-60"
+      />
+      {hint && <span className="text-xs text-muted-foreground">{hint}</span>}
     </label>
   )
 }
