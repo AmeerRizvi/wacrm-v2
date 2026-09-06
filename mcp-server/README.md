@@ -82,6 +82,17 @@ when their guard is set.
 | `update_contact`     | write     | `contacts:write`     | Update a contact / replace its tags             |
 | `send_broadcast`     | broadcast | `broadcasts:send`    | Launch a template broadcast (requires `confirm`)|
 
+### Multiple WhatsApp numbers
+
+`send_message` and `send_broadcast` accept an optional `channel_id` (the
+`whatsapp_config` UUID). Supply it when the workspace has multiple WhatsApp
+numbers so the MCP caller explicitly chooses the sender. If it is omitted,
+wacrm uses the workspace primary channel for backward compatibility.
+
+A send against an existing conversation still cannot move that conversation
+to another number: the REST API and send core validate the stored conversation
+channel and reject conflicting channel context.
+
 ## Safety model
 
 Sending WhatsApp messages through an LLM is a real-world side effect, so
@@ -97,6 +108,10 @@ the server layers three guards:
 3. **Explicit broadcast confirmation.** `send_broadcast` refuses to run
    unless called with `confirm: true`, and is marked `destructive` so
    compliant clients prompt the user first.
+
+For multi-number workspaces, treat the selected WhatsApp channel as part of
+send confirmation: verify both the recipient list/content and the `channel_id`
+before allowing a write tool to run.
 
 ## Development
 
