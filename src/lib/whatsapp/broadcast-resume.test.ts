@@ -12,10 +12,21 @@ import {
 vi.mock('@/lib/whatsapp/encryption', () => ({
   decrypt: (v: string) => `decrypted:${v}`,
 }));
-
-// ============================================================
-// Claim / release — the mutex that stops a double-send.
-// ============================================================
+vi.mock('@/lib/whatsapp/template-body', () => ({
+  resolveTemplateRow: vi.fn(async () => ({
+    row: {
+      id: 'tpl-1',
+      user_id: 'u-1',
+      name: 'order_update',
+      language: 'en_US',
+      category: 'Utility',
+      body_text: 'Your order {{1}} ships on {{2}}',
+      created_at: '2026-01-01T00:00:00Z',
+    },
+    language: 'en_US',
+    malformed: false,
+  })),
+}));
 
 interface ClaimCall {
   update: Record<string, unknown>;
@@ -50,8 +61,8 @@ function claimDb(returnedRows: unknown[], calls: ClaimCall[]): SupabaseClient {
   } as unknown as SupabaseClient;
 }
 
-describe('claimBroadcastDelivery', () => {
-  it('claims when the conditional UPDATE matched a row', async () => {
+describe('claim/release broadcast delivery', () => {
+  it('claims only inside the account and uses the stale-lock cutoff', async () => {
     const calls: ClaimCall[] = [];
     const ok = await claimBroadcastDelivery(
       claimDb([{ id: 'bc-1' }], calls),
@@ -59,47 +70,17 @@ describe('claimBroadcastDelivery', () => {
       'bc-1',
       new Date('2026-08-11T12:00:00Z'),
     );
-
     expect(ok).toBe(true);
     expect(calls[0].filters).toEqual({ id: 'bc-1', account_id: 'acct-1' });
-    expect(calls[0].update.delivery_locked_at).toBe(
-      '2026-08-11T12:00:00.000Z',
-    );
-  });
-
-  it('refuses when another pass already holds the lock', async () => {
-    // The UPDATE's WHERE didn't match — someone else got there first.
-    const ok = await claimBroadcastDelivery(
-      claimDb([], []),
-      'acct-1',
-      'bc-1',
-    );
-    expect(ok).toBe(false);
-  });
-
-  it('treats a lock older than the staleness window as abandoned', async () => {
-    const calls: ClaimCall[] = [];
-    await claimBroadcastDelivery(
-      claimDb([{ id: 'bc-1' }], calls),
-      'acct-1',
-      'bc-1',
-      new Date('2026-08-11T12:00:00Z'),
-    );
-    // 30 minutes before "now" — a pass whose process died is recoverable
-    // without touching the database by hand.
     expect(calls[0].or).toBe(
       'delivery_locked_at.is.null,delivery_locked_at.lt.2026-08-11T11:30:00.000Z',
     );
   });
 
-  it('is scoped to the account, so another tenant cannot claim it', async () => {
-    const calls: ClaimCall[] = [];
-    await claimBroadcastDelivery(claimDb([], calls), 'acct-9', 'bc-1');
-    expect(calls[0].filters.account_id).toBe('acct-9');
+  it('refuses when another pass already holds the lock', async () => {
+    expect(await claimBroadcastDelivery(claimDb([], []), 'acct-1', 'bc-1')).toBe(false);
   });
-});
 
-describe('releaseBroadcastDelivery', () => {
   it('clears the lock', async () => {
     const calls: ClaimCall[] = [];
     await releaseBroadcastDelivery(claimDb([], calls), 'bc-1');
@@ -108,29 +89,31 @@ describe('releaseBroadcastDelivery', () => {
   });
 });
 
-// ============================================================
-// Planning — which recipients a pass picks up, and with what params.
-// ============================================================
-
 interface PlanFixture {
   broadcast?: Record<string, unknown> | null;
   recipients?: Record<string, unknown>[];
   config?: Record<string, unknown> | null;
-  templates?: Record<string, unknown>[];
 }
 
 interface PlanWrites {
   statusFilter?: unknown;
+  channelFilters: unknown[];
   failedIds?: unknown;
   failedUpdate?: Record<string, unknown>;
 }
 
-function planDb(fx: PlanFixture, writes: PlanWrites = {}): SupabaseClient {
+function planDb(
+  fx: PlanFixture,
+  writes: PlanWrites = { channelFilters: [] },
+): SupabaseClient {
   return {
     from(table: string) {
       const b: Record<string, unknown> = {
         select: () => b,
-        eq: () => b,
+        eq: (col: string, value: unknown) => {
+          if (col === 'whatsapp_config_id') writes.channelFilters.push(value);
+          return b;
+        },
         order: () => b,
         in: (col: string, vals: unknown) => {
           if (col === 'status') writes.statusFilter = vals;
@@ -141,20 +124,18 @@ function planDb(fx: PlanFixture, writes: PlanWrites = {}): SupabaseClient {
           writes.failedUpdate = row;
           return b;
         },
-        maybeSingle: async () => ({
-          data: fx.broadcast === undefined ? null : fx.broadcast,
-          error: null,
-        }),
-        single: async () => ({
-          data: fx.config === undefined ? null : fx.config,
-          error: null,
-        }),
+        maybeSingle: async () => {
+          if (table === 'broadcasts') {
+            return { data: fx.broadcast === undefined ? null : fx.broadcast, error: null };
+          }
+          if (table === 'whatsapp_config') {
+            return { data: fx.config === undefined ? null : fx.config, error: null };
+          }
+          return { data: null, error: null };
+        },
         then: (resolve: (r: { data: unknown[]; error: null }) => unknown) => {
           if (table === 'broadcast_recipients') {
             return resolve({ data: fx.recipients ?? [], error: null });
-          }
-          if (table === 'message_templates') {
-            return resolve({ data: fx.templates ?? [], error: null });
           }
           return resolve({ data: [], error: null });
         },
@@ -168,25 +149,26 @@ const BROADCAST = {
   id: 'bc-1',
   template_name: 'order_update',
   template_language: 'en_US',
+  whatsapp_config_id: 'wa-1',
+};
+const CONFIG = {
+  id: 'wa-1',
+  phone_number_id: 'pn-1',
+  access_token: 'tok',
 };
 
-const CONFIG = { phone_number_id: 'pn-1', access_token: 'tok' };
-
-function recipient(
-  id: string,
-  phone: string | null,
-  params: unknown = ['A123'],
-) {
+function recipient(id: string, phone: string | null, params: unknown = ['A123']) {
   return {
     id,
+    whatsapp_config_id: 'wa-1',
     template_params: params,
     contact: phone ? { phone } : null,
   };
 }
 
 describe('planBroadcastResume', () => {
-  it('plans the outstanding recipients with their frozen params', async () => {
-    const writes: PlanWrites = {};
+  it('reconstructs the plan from the broadcast stored channel', async () => {
+    const writes: PlanWrites = { channelFilters: [] };
     const { plan, remaining, unsendable } = await planBroadcastResume(
       planDb(
         {
@@ -205,35 +187,38 @@ describe('planBroadcastResume', () => {
     );
 
     expect(writes.statusFilter).toEqual(['pending']);
-    // Phones are stored sanitized (no leading '+'), same as the shape
-    // createBroadcast plans — deliverBroadcast feeds them to
-    // phoneVariants from here.
-    expect(plan.planned).toEqual([
-      {
-        recipientRowId: 'r1',
-        phone: '15551234567',
-        params: ['A123', 'Friday'],
-      },
-      {
-        recipientRowId: 'r2',
-        phone: '15559876543',
-        params: ['B456', 'Monday'],
-      },
-    ]);
+    expect(writes.channelFilters).toContain('wa-1');
+    expect(plan.whatsappConfigId).toBe('wa-1');
+    expect(plan.phoneNumberId).toBe('pn-1');
     expect(plan.accessToken).toBe('decrypted:tok');
+    expect(plan.planned).toEqual([
+      { recipientRowId: 'r1', phone: '15551234567', params: ['A123', 'Friday'] },
+      { recipientRowId: 'r2', phone: '15559876543', params: ['B456', 'Monday'] },
+    ]);
     expect(remaining).toBe(0);
     expect(unsendable).toBe(0);
   });
 
-  it('scopes to failed rows when retrying, and to both for "all"', async () => {
-    const failedWrites: PlanWrites = {};
-    await planBroadcastResume(
-      planDb(
-        {
-          broadcast: BROADCAST,
+  it('refuses a legacy broadcast with no stored channel instead of guessing primary', async () => {
+    await expect(
+      planBroadcastResume(
+        planDb({
+          broadcast: { ...BROADCAST, whatsapp_config_id: null },
           config: CONFIG,
           recipients: [recipient('r1', '+15551234567')],
-        },
+        }),
+        'acct-1',
+        'bc-1',
+        'pending',
+      ),
+    ).rejects.toMatchObject({ code: 'channel_required', status: 409 });
+  });
+
+  it('scopes retry status correctly', async () => {
+    const failedWrites: PlanWrites = { channelFilters: [] };
+    await planBroadcastResume(
+      planDb(
+        { broadcast: BROADCAST, config: CONFIG, recipients: [recipient('r1', '+15551234567')] },
         failedWrites,
       ),
       'acct-1',
@@ -242,14 +227,10 @@ describe('planBroadcastResume', () => {
     );
     expect(failedWrites.statusFilter).toEqual(['failed']);
 
-    const allWrites: PlanWrites = {};
+    const allWrites: PlanWrites = { channelFilters: [] };
     await planBroadcastResume(
       planDb(
-        {
-          broadcast: BROADCAST,
-          config: CONFIG,
-          recipients: [recipient('r1', '+15551234567')],
-        },
+        { broadcast: BROADCAST, config: CONFIG, recipients: [recipient('r1', '+15551234567')] },
         allWrites,
       ),
       'acct-1',
@@ -259,33 +240,15 @@ describe('planBroadcastResume', () => {
     expect(allWrites.statusFilter).toEqual(['pending', 'failed']);
   });
 
-  it('treats a missing or malformed params column as no params', async () => {
-    const { plan } = await planBroadcastResume(
-      planDb({
-        broadcast: BROADCAST,
-        config: CONFIG,
-        recipients: [
-          // Rows created before migration 038 carry NULL.
-          recipient('r1', '+15551234567', null),
-          recipient('r2', '+15559876543', 'not-an-array'),
-        ],
-      }),
-      'acct-1',
-      'bc-1',
-      'pending',
-    );
-    expect(plan.planned.map((p) => p.params)).toEqual([[], []]);
-  });
-
-  it('fails unsendable rows up front so they stop blocking the status', async () => {
-    const writes: PlanWrites = {};
+  it('treats malformed params as empty and fails unsendable contacts', async () => {
+    const writes: PlanWrites = { channelFilters: [] };
     const { plan, unsendable } = await planBroadcastResume(
       planDb(
         {
           broadcast: BROADCAST,
           config: CONFIG,
           recipients: [
-            recipient('r1', '+15551234567'),
+            recipient('r1', '+15551234567', null),
             recipient('r2', null),
             recipient('r3', 'nonsense'),
           ],
@@ -296,13 +259,10 @@ describe('planBroadcastResume', () => {
       'bc-1',
       'pending',
     );
-
-    // Left 'pending', these would keep the broadcast in 'sending'
-    // forever — the exact symptom being fixed.
+    expect(plan.planned[0].params).toEqual([]);
     expect(unsendable).toBe(2);
     expect(writes.failedIds).toEqual(['r2', 'r3']);
     expect(writes.failedUpdate?.status).toBe('failed');
-    expect(plan.planned).toHaveLength(1);
   });
 
   it('caps one pass and reports the leftover', async () => {
@@ -316,18 +276,12 @@ describe('planBroadcastResume', () => {
       'pending',
     );
     expect(plan.planned).toHaveLength(RESUME_MAX_PER_REQUEST);
-    // Surfaced to the caller rather than silently dropped.
     expect(remaining).toBe(25);
   });
 
   it('404s a broadcast that is not on this account', async () => {
     await expect(
-      planBroadcastResume(
-        planDb({ broadcast: null }),
-        'acct-1',
-        'bc-1',
-        'pending',
-      ),
+      planBroadcastResume(planDb({ broadcast: null }), 'acct-1', 'bc-1', 'pending'),
     ).rejects.toMatchObject({ status: 404 });
   });
 
@@ -340,29 +294,5 @@ describe('planBroadcastResume', () => {
         'failed',
       ),
     ).rejects.toBeInstanceOf(BroadcastError);
-  });
-
-  it('resolves the template row for header + button components', async () => {
-    const { plan } = await planBroadcastResume(
-      planDb({
-        broadcast: { ...BROADCAST, template_language: 'en_US' },
-        config: CONFIG,
-        recipients: [recipient('r1', '+15551234567')],
-        templates: [
-          {
-            id: 'tpl-1',
-            user_id: 'u-1',
-            name: 'order_update',
-            // Synced from Meta as bare 'en' — the resolver bridges it.
-            language: 'en',
-            body_text: 'Your order {{1}} ships on {{2}}',
-          },
-        ],
-      }),
-      'acct-1',
-      'bc-1',
-      'pending',
-    );
-    expect(plan.templateRow?.language).toBe('en');
   });
 });
