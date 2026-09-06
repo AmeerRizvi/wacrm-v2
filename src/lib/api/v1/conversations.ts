@@ -8,9 +8,6 @@
 
 import type { Conversation, Message } from '@/types';
 
-type ChannelConversation = Conversation & { whatsapp_config_id?: string | null };
-type ChannelMessage = Message & { whatsapp_config_id?: string | null };
-
 export interface ApiConversation {
   id: string;
   channel_id: string | null;
@@ -50,11 +47,10 @@ export interface ApiMessage {
 }
 
 export function serializeConversation(conv: Conversation): ApiConversation {
-  const row = conv as ChannelConversation;
   const c = conv.contact;
   return {
     id: conv.id,
-    channel_id: row.whatsapp_config_id ?? null,
+    channel_id: conv.whatsapp_config_id ?? null,
     contact_id: conv.contact_id,
     status: conv.status,
     assigned_agent_id: conv.assigned_agent_id ?? null,
@@ -81,10 +77,9 @@ export function serializeConversation(conv: Conversation): ApiConversation {
 }
 
 export function serializeMessage(m: Message): ApiMessage {
-  const row = m as ChannelMessage;
   return {
     id: m.id,
-    channel_id: row.whatsapp_config_id ?? null,
+    channel_id: m.whatsapp_config_id ?? null,
     conversation_id: m.conversation_id,
     direction: m.sender_type === 'customer' ? 'inbound' : 'outbound',
     sender_type: m.sender_type,
