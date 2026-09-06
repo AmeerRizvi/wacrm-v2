@@ -13,16 +13,25 @@ const categoryColors: Record<string, string> = {
   Authentication: 'bg-orange-500/10 text-orange-400 border-orange-500/20',
 };
 
+type ChannelTemplate = MessageTemplate & { whatsapp_config_id?: string | null };
+type ChannelMeta = {
+  id: string;
+  label: string | null;
+  phone_number_id: string;
+  is_primary: boolean;
+};
+
 interface Step1Props {
-  selectedTemplate: MessageTemplate | null;
-  onSelect: (template: MessageTemplate) => void;
+  selectedTemplate: ChannelTemplate | null;
+  onSelect: (template: ChannelTemplate) => void;
   onNext: () => void;
   onBack: () => void;
 }
 
 export function Step1ChooseTemplate({ selectedTemplate, onSelect, onNext, onBack }: Step1Props) {
   const t = useTranslations('Broadcasts.wizard');
-  const [templates, setTemplates] = useState<MessageTemplate[]>([]);
+  const [templates, setTemplates] = useState<ChannelTemplate[]>([]);
+  const [channels, setChannels] = useState<Map<string, ChannelMeta>>(new Map());
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -30,17 +39,30 @@ export function Step1ChooseTemplate({ selectedTemplate, onSelect, onNext, onBack
     async function fetchTemplates() {
       try {
         const supabase = createClient();
-        // Only APPROVED templates can be sent via Meta — anything else
-        // would 400 at broadcast time. Hide them rather than letting
-        // the user pick a template that will fail.
-        const { data, error: fetchError } = await supabase
-          .from('message_templates')
-          .select('*')
-          .eq('status', 'APPROVED')
-          .order('created_at', { ascending: false });
+        const [templateResult, channelResult] = await Promise.all([
+          supabase
+            .from('message_templates')
+            .select('*')
+            .eq('status', 'APPROVED')
+            .not('whatsapp_config_id', 'is', null)
+            .order('created_at', { ascending: false }),
+          supabase
+            .from('whatsapp_config')
+            .select('id,label,phone_number_id,is_primary'),
+        ]);
 
-        if (fetchError) throw fetchError;
-        setTemplates(data ?? []);
+        if (templateResult.error) throw templateResult.error;
+        if (channelResult.error) throw channelResult.error;
+
+        setTemplates((templateResult.data as ChannelTemplate[] | null) ?? []);
+        setChannels(
+          new Map(
+            ((channelResult.data as ChannelMeta[] | null) ?? []).map((channel) => [
+              channel.id,
+              channel,
+            ]),
+          ),
+        );
       } catch (err) {
         setError(err instanceof Error ? err.message : t('chooseTemplate.errorLoad'));
       } finally {
@@ -48,8 +70,8 @@ export function Step1ChooseTemplate({ selectedTemplate, onSelect, onNext, onBack
       }
     }
 
-    fetchTemplates();
-  }, []);
+    void fetchTemplates();
+  }, [t]);
 
   if (loading) {
     return (
@@ -72,7 +94,7 @@ export function Step1ChooseTemplate({ selectedTemplate, onSelect, onNext, onBack
       <div>
         <h2 className="text-lg font-semibold text-foreground">{t('chooseTemplate.title')}</h2>
         <p className="mt-1 text-sm text-muted-foreground">
-          {t('chooseTemplate.subtitle')}
+          Choose the approved template from the WhatsApp number that should send this broadcast.
         </p>
       </div>
 
@@ -87,10 +109,14 @@ export function Step1ChooseTemplate({ selectedTemplate, onSelect, onNext, onBack
           {templates.map((template) => {
             const isSelected = selectedTemplate?.id === template.id;
             const catColor = categoryColors[template.category] ?? categoryColors.Utility;
+            const channel = template.whatsapp_config_id
+              ? channels.get(template.whatsapp_config_id)
+              : undefined;
 
             return (
               <button
                 key={template.id}
+                type="button"
                 onClick={() => onSelect(template)}
                 className={`flex flex-col gap-3 rounded-xl border p-4 text-left transition-all ${
                   isSelected
@@ -98,20 +124,25 @@ export function Step1ChooseTemplate({ selectedTemplate, onSelect, onNext, onBack
                     : 'border-border bg-card/50 hover:border-border hover:bg-card'
                 }`}
               >
-                <div className="flex items-start justify-between">
-                  <h3 className="text-sm font-medium text-foreground">{template.name}</h3>
+                <div className="flex items-start justify-between gap-2">
+                  <h3 className="min-w-0 truncate text-sm font-medium text-foreground">
+                    {template.name}
+                  </h3>
                   <span
-                    className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-medium ${catColor}`}
+                    className={`inline-flex shrink-0 items-center rounded-full border px-2 py-0.5 text-[10px] font-medium ${catColor}`}
                   >
                     {template.category}
                   </span>
                 </div>
                 <p className="line-clamp-3 text-xs text-muted-foreground">{template.body_text}</p>
-                <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
-                  <span>{template.language ?? 'en_US'}</span>
-                  {/* Status is omitted on purpose — every template
-                      shown here is already filtered to APPROVED,
-                      so the chip carried no information. */}
+                <div className="space-y-1 text-[10px] text-muted-foreground">
+                  <div className="flex items-center gap-2">
+                    <span>{template.language ?? 'en_US'}</span>
+                    {channel?.is_primary && <span>Primary</span>}
+                  </div>
+                  <p className="truncate font-medium text-foreground/80">
+                    From: {channel?.label || channel?.phone_number_id || 'Unknown WhatsApp channel'}
+                  </p>
                 </div>
               </button>
             );
@@ -125,7 +156,7 @@ export function Step1ChooseTemplate({ selectedTemplate, onSelect, onNext, onBack
         </Button>
         <Button
           onClick={onNext}
-          disabled={!selectedTemplate}
+          disabled={!selectedTemplate?.whatsapp_config_id}
           className="bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
         >
           {t('next')}
