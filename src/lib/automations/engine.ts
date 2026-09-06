@@ -34,6 +34,8 @@ export interface AutomationContext {
   message_text?: string
   /** Conversation the event belongs to, if any. */
   conversation_id?: string
+  /** WhatsApp channel the triggering conversation belongs to. */
+  channel_id?: string
   /** Arbitrary variables accumulated during execution. */
   vars?: Record<string, unknown>
   /** The tag id that was added, for tag_added trigger. */
@@ -92,6 +94,34 @@ export async function runAutomationsForTrigger(input: DispatchInput): Promise<vo
       }
     }
 
+    // Conversation ids are also caller-controllable on the manual engine API.
+    // Validate them before a service-role step can assign/close/send on the
+    // wrong thread. If a channel id is present, require it to match as well.
+    if (input.context?.conversation_id) {
+      const { data: ownedConversation, error: conversationError } = await db
+        .from('conversations')
+        .select('id,contact_id,whatsapp_config_id')
+        .eq('id', input.context.conversation_id)
+        .eq('account_id', input.accountId)
+        .maybeSingle()
+      if (conversationError || !ownedConversation) {
+        console.warn('[automations] conversation not in account, refusing dispatch')
+        return
+      }
+      if (input.contactId && ownedConversation.contact_id !== input.contactId) {
+        console.warn('[automations] conversation/contact mismatch, refusing dispatch')
+        return
+      }
+      if (
+        input.context.channel_id &&
+        ownedConversation.whatsapp_config_id &&
+        ownedConversation.whatsapp_config_id !== input.context.channel_id
+      ) {
+        console.warn('[automations] conversation/channel mismatch, refusing dispatch')
+        return
+      }
+    }
+
     const { data: automations, error } = await db
       .from('automations')
       .select('*')
@@ -143,7 +173,8 @@ export async function resumePendingExecution(pending: {
     .from('automations')
     .select('*')
     .eq('id', pending.automation_id)
-    .single()
+    .eq('account_id', pending.account_id)
+    .maybeSingle()
 
   if (error || !automation) {
     console.error('[automations] resume: missing automation', pending.automation_id, error)
@@ -483,6 +514,7 @@ async function runStep(step: AutomationStep, args: ExecuteArgs): Promise<string>
     case 'assign_conversation': {
       const cfg = step.step_config as AssignConversationStepConfig
       if (!args.contactId) throw new Error('assign_conversation needs a contact')
+      const conversationId = await resolveConversationId(args)
       let agentId = cfg.agent_id
       if (cfg.mode === 'round_robin') {
         // Pick any member of the account. The existing implementation
@@ -496,11 +528,23 @@ async function runStep(step: AutomationStep, args: ExecuteArgs): Promise<string>
         agentId = profiles?.[0]?.user_id
       }
       if (!agentId) return 'no agent resolved'
+
+      // Direct assignment ids live in automation configuration, which is
+      // account-controlled but executed with service-role. Revalidate the
+      // target agent before writing so a stale/forged id cannot cross tenants.
+      const { data: member } = await db
+        .from('profiles')
+        .select('user_id')
+        .eq('user_id', agentId)
+        .eq('account_id', args.automation.account_id)
+        .maybeSingle()
+      if (!member) throw new Error('assignment target is not a member of this account')
+
       await db
         .from('conversations')
         .update({ assigned_agent_id: agentId })
+        .eq('id', conversationId)
         .eq('account_id', args.automation.account_id)
-        .eq('contact_id', args.contactId)
       return `assigned to ${agentId}`
     }
 
@@ -611,11 +655,12 @@ async function runStep(step: AutomationStep, args: ExecuteArgs): Promise<string>
 
     case 'close_conversation': {
       if (!args.contactId) throw new Error('close_conversation needs a contact')
+      const conversationId = await resolveConversationId(args)
       await db
         .from('conversations')
         .update({ status: 'closed', updated_at: new Date().toISOString() })
+        .eq('id', conversationId)
         .eq('account_id', args.automation.account_id)
-        .eq('contact_id', args.contactId)
       return 'conversation closed'
     }
 
@@ -629,30 +674,60 @@ async function runStep(step: AutomationStep, args: ExecuteArgs): Promise<string>
 // ------------------------------------------------------------
 
 /**
- * Pick the conversation a send-type step should use. Prefer the id the
- * webhook handed us (it's the one that just got the inbound message);
- * fall back to the contact's conversation for resumed/wait paths and
- * manual engine POSTs. Throws if none exists — send steps have
- * no meaningful target without a conversation.
+ * Pick the single conversation an action should target. The triggering
+ * conversation is authoritative. For delayed/tag/manual paths without an id,
+ * channel_id can disambiguate. If a contact has multiple channel threads and
+ * neither is supplied, fail instead of guessing or mutating every thread.
  */
 async function resolveConversationId(args: ExecuteArgs): Promise<string> {
+  const db = supabaseAdmin()
   const fromCtx = args.context.conversation_id
-  if (fromCtx) return fromCtx
+  if (fromCtx) {
+    let query = db
+      .from('conversations')
+      .select('id,contact_id,whatsapp_config_id')
+      .eq('id', fromCtx)
+      .eq('account_id', args.automation.account_id)
+    if (args.contactId) query = query.eq('contact_id', args.contactId)
+    const { data, error } = await query.maybeSingle()
+    if (error || !data?.id) {
+      throw new Error('automation conversation is not valid for this account/contact')
+    }
+    if (
+      args.context.channel_id &&
+      data.whatsapp_config_id &&
+      data.whatsapp_config_id !== args.context.channel_id
+    ) {
+      throw new Error('automation conversation does not match its WhatsApp channel')
+    }
+    return data.id as string
+  }
+
   if (!args.contactId) throw new Error('cannot resolve conversation: no contact')
-  const { data, error } = await supabaseAdmin()
+  let query = db
     .from('conversations')
-    .select('id')
+    .select('id,whatsapp_config_id')
     .eq('account_id', args.automation.account_id)
     .eq('contact_id', args.contactId)
-    .maybeSingle()
+    .order('created_at', { ascending: true })
+    .limit(2)
+  if (args.context.channel_id) {
+    query = query.eq('whatsapp_config_id', args.context.channel_id)
+  }
+  const { data, error } = await query
   if (error) throw new Error(`conversation lookup failed: ${error.message}`)
-  if (!data?.id) {
+  if (!data?.length) {
     const prefix = args.triggerEvent === 'tag_added'
       ? 'tag_added automation cannot send'
-      : 'cannot send'
+      : 'cannot resolve conversation'
     throw new Error(`${prefix}: contact has no existing conversation`)
   }
-  return data.id as string
+  if (data.length > 1) {
+    throw new Error(
+      'contact has multiple WhatsApp conversations; conversation_id or channel_id is required',
+    )
+  }
+  return data[0].id as string
 }
 
 /** Letter, digit or underscore in any script — the "inside a word" test. */
