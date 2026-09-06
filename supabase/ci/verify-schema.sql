@@ -69,6 +69,11 @@ BEGIN
 
   IF NOT EXISTS (
     SELECT 1 FROM pg_trigger
+    WHERE tgname = 'lock_whatsapp_channel_before_delete' AND NOT tgisinternal
+  ) THEN RAISE EXCEPTION 'primary-channel delete lock-order trigger is missing'; END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_trigger
     WHERE tgname = 'promote_whatsapp_primary_after_delete' AND NOT tgisinternal
   ) THEN RAISE EXCEPTION 'primary-channel delete promotion trigger is missing'; END IF;
 
