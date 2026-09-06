@@ -21,6 +21,8 @@ const steps = [
   { label: 'send', key: 'send' },
 ] as const;
 
+type ChannelTemplate = MessageTemplate & { whatsapp_config_id?: string | null };
+
 export default function NewBroadcastPage() {
   const router = useRouter();
   const t = useTranslations('Broadcasts.new');
@@ -28,7 +30,7 @@ export default function NewBroadcastPage() {
   const { createAndSendBroadcast, isProcessing, progress } = useBroadcastSending();
 
   const [currentStep, setCurrentStep] = useState(0);
-  const [template, setTemplate] = useState<MessageTemplate | null>(null);
+  const [template, setTemplate] = useState<ChannelTemplate | null>(null);
   const [audience, setAudience] = useState<{
     type: 'all' | 'tags' | 'custom_field' | 'csv';
     tagIds?: string[];
@@ -48,6 +50,10 @@ export default function NewBroadcastPage() {
 
   async function handleSend() {
     if (!template) return;
+    if (!template.whatsapp_config_id) {
+      toast.error('This template is not linked to a WhatsApp number. Sync it and select it again.');
+      return;
+    }
 
     try {
       const broadcastId = await createAndSendBroadcast({
@@ -65,28 +71,22 @@ export default function NewBroadcastPage() {
       });
       router.push(`/broadcasts/${broadcastId}`);
     } catch (err) {
-      // Previously swallowed with console.error — the wizard would
-      // just no-op, leaving the user confused. Surface the reason.
       const message = err instanceof Error ? err.message : 'Broadcast failed';
       console.error('Broadcast failed:', err);
       toast.error(message);
     }
   }
 
-  /**
-   * Writes a draft broadcast row — no recipients, no sending. The user
-   * can revisit it via the list page to finish the flow later. We
-   * don't persist the in-progress audience/variable config here
-   * because the current schema doesn't carry it past `audience_filter`
-   * and `template_variables`; those are enough for the user to
-   * recognize the draft but not to exactly round-trip into the wizard.
-   * A full resume-draft UX is a future polish.
-   */
   async function handleSaveDraft() {
     if (!template || !name.trim()) {
       toast.error(t('toastGiveName'));
       return;
     }
+    if (!template.whatsapp_config_id) {
+      toast.error('This template is not linked to a WhatsApp number. Sync it and select it again.');
+      return;
+    }
+
     const supabase = createClient();
     const {
       data: { session },
@@ -104,6 +104,7 @@ export default function NewBroadcastPage() {
     const { error } = await supabase.from('broadcasts').insert({
       user_id: user.id,
       account_id: accountId,
+      whatsapp_config_id: template.whatsapp_config_id,
       name: name.trim(),
       template_name: template.name,
       template_language: template.language ?? 'en_US',
@@ -131,15 +132,11 @@ export default function NewBroadcastPage() {
 
   return (
     <div className="mx-auto max-w-3xl space-y-8">
-      {/* Header */}
       <div>
         <h1 className="text-2xl font-bold text-foreground">{t('title')}</h1>
-        <p className="mt-1 text-sm text-muted-foreground">
-          {t('subtitle')}
-        </p>
+        <p className="mt-1 text-sm text-muted-foreground">{t('subtitle')}</p>
       </div>
 
-      {/* Step Indicator */}
       <div className="flex items-center justify-between">
         {steps.map((step, index) => {
           const isActive = index === currentStep;
@@ -161,7 +158,11 @@ export default function NewBroadcastPage() {
                 </div>
                 <span
                   className={`hidden text-sm font-medium sm:block ${
-                    isActive ? 'text-foreground' : isCompleted ? 'text-primary' : 'text-muted-foreground'
+                    isActive
+                      ? 'text-foreground'
+                      : isCompleted
+                        ? 'text-primary'
+                        : 'text-muted-foreground'
                   }`}
                 >
                   {t(`steps.${step.label}`)}
@@ -179,7 +180,6 @@ export default function NewBroadcastPage() {
         })}
       </div>
 
-      {/* Step Content */}
       <div className="relative min-h-[400px]">
         <div
           className="transition-all duration-300 ease-in-out"
