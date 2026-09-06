@@ -232,6 +232,7 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'phone_number_id is required' }, { status: 400 })
     }
     const phoneNumberId = phone_number_id.trim()
+    const nextWabaId = typeof waba_id === 'string' && waba_id.trim() ? waba_id.trim() : null
 
     if (pin !== undefined && pin !== null && pin !== '') {
       if (typeof pin !== 'string' || !/^\d{6}$/.test(pin)) {
@@ -259,6 +260,26 @@ export async function POST(request: Request) {
           },
           { status: 409 },
         )
+      }
+
+      if (existing.waba_id !== nextWabaId) {
+        const { count, error: templateCountError } = await supabase
+          .from('message_templates')
+          .select('id', { count: 'exact', head: true })
+          .eq('account_id', accountId)
+          .eq('whatsapp_config_id', existing.id)
+        if (templateCountError) {
+          return NextResponse.json({ error: 'Failed to validate WABA change' }, { status: 500 })
+        }
+        if ((count ?? 0) > 0) {
+          return NextResponse.json(
+            {
+              error:
+                'WABA ID cannot be changed after templates have been synced or submitted for this channel. Add a new channel, or remove the channel template history first.',
+            },
+            { status: 409 },
+          )
+        }
       }
     }
 
@@ -351,10 +372,11 @@ export async function POST(request: Request) {
       }
     }
 
-    let subscribedAppsAt = existing?.subscribed_apps_at ?? null
-    if (typeof waba_id === 'string' && waba_id.trim()) {
+    const wabaChanged = existing?.waba_id !== nextWabaId
+    let subscribedAppsAt = wabaChanged ? null : existing?.subscribed_apps_at ?? null
+    if (nextWabaId) {
       try {
-        await subscribeWabaToApp({ wabaId: waba_id.trim(), accessToken: plainAccessToken })
+        await subscribeWabaToApp({ wabaId: nextWabaId, accessToken: plainAccessToken })
         subscribedAppsAt = new Date().toISOString()
       } catch (err) {
         console.warn(
@@ -371,7 +393,7 @@ export async function POST(request: Request) {
         : ''
     const baseRow = {
       phone_number_id: phoneNumberId,
-      waba_id: typeof waba_id === 'string' && waba_id.trim() ? waba_id.trim() : null,
+      waba_id: nextWabaId,
       label:
         typeof label === 'string' && label.trim()
           ? label.trim()
