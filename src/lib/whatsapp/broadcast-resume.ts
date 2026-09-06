@@ -1,19 +1,9 @@
 // ============================================================
 // Broadcast resume / retry (issue #472).
 //
-// The dashboard wizard drives its own send loop from the browser tab
-// that started the campaign, so closing the tab abandons the campaign
-// mid-flight: the remaining recipients stay 'pending' and the
-// broadcast sits in 'sending' forever. This module is the recovery —
-// and the same machinery answers the reporter's other two asks,
-// "reprocess pending" and "reprocess failed".
-//
-// It deliberately reuses `deliverBroadcast` rather than growing a
-// second fan-out loop: same phone-variant retry, same per-recipient
-// stamping, same trigger-owned counts.
-//
-// What it does NOT do is move the *initial* send server-side. The
-// wizard still owns that; this makes an abandoned one recoverable.
+// A resumed campaign must use the exact WhatsApp channel stored on the
+// broadcast. Changing the workspace primary after a campaign was created must
+// never change the number used by Retry/Resume.
 // ============================================================
 
 import type { SupabaseClient } from '@supabase/supabase-js';
@@ -23,7 +13,6 @@ import { decrypt } from '@/lib/whatsapp/encryption';
 import { resolveTemplateRow } from '@/lib/whatsapp/template-body';
 import { sanitizePhoneForMeta, isValidE164 } from '@/lib/whatsapp/phone-utils';
 
-/** Which recipients a resume pass picks up. */
 export type ResumeScope = 'pending' | 'failed' | 'all';
 
 export const RESUME_SCOPES: readonly ResumeScope[] = [
@@ -32,22 +21,7 @@ export const RESUME_SCOPES: readonly ResumeScope[] = [
   'all',
 ];
 
-/**
- * Recipients delivered per resume request. One pass runs inside
- * `after()`, so it is bounded by the host's function timeout — the cap
- * keeps a 5 000-recipient backlog from being one un-completable unit
- * of work. Whatever is left stays 'pending' and the caller is told how
- * many, so the UI can offer Resume again. Matches the public API's
- * per-request recipient cap.
- */
 export const RESUME_MAX_PER_REQUEST = 1000;
-
-/**
- * How long a `delivery_locked_at` stamp is honoured before it is read
- * as abandoned. Long enough that a legitimately slow pass is never
- * stolen from, short enough that a crashed one doesn't wedge the
- * campaign until someone touches the database.
- */
 export const DELIVERY_LOCK_STALE_MS = 30 * 60 * 1000;
 
 function scopeStatuses(scope: ResumeScope): string[] {
@@ -56,14 +30,6 @@ function scopeStatuses(scope: ResumeScope): string[] {
   return ['pending', 'failed'];
 }
 
-/**
- * Take the delivery lock for a broadcast.
- *
- * One conditional UPDATE, so the claim is atomic: a concurrent caller's
- * WHERE no longer matches and it gets `false`. Returns false when the
- * broadcast doesn't exist on this account, too — the caller treats both
- * as "not yours to run".
- */
 export async function claimBroadcastDelivery(
   db: SupabaseClient,
   accountId: string,
@@ -89,7 +55,6 @@ export async function claimBroadcastDelivery(
   return Array.isArray(data) && data.length > 0;
 }
 
-/** Release the delivery lock. Best-effort; a stale lock self-expires. */
 export async function releaseBroadcastDelivery(
   db: SupabaseClient,
   broadcastId: string
@@ -105,39 +70,22 @@ export async function releaseBroadcastDelivery(
 
 export interface ResumePlan {
   plan: BroadcastPlan;
-  /** In-scope recipients left over after the per-request cap. */
   remaining: number;
-  /**
-   * In-scope rows that can never send because their contact has no
-   * usable phone. Stamped 'failed' by {@link planBroadcastResume} so
-   * they stop blocking the broadcast's terminal status.
-   */
   unsendable: number;
 }
 
 interface RecipientRow {
   id: string;
   template_params: unknown;
+  whatsapp_config_id?: string | null;
   contact: { phone?: string | null } | { phone?: string | null }[] | null;
 }
 
-/** Supabase renders an embedded to-one join as an object or a 1-array. */
 function contactPhone(row: RecipientRow): string | null {
   const c = Array.isArray(row.contact) ? row.contact[0] : row.contact;
   return c?.phone ?? null;
 }
 
-/**
- * Build a {@link BroadcastPlan} for the recipients of an existing
- * broadcast that still need sending.
- *
- * Params come off the recipient rows (frozen at plan time by migration
- * 038) rather than being re-resolved from contact data, so a resume
- * sends what the original pass would have sent even if the contact has
- * been edited since.
- *
- * Throws {@link BroadcastError}; the route maps it.
- */
 export async function planBroadcastResume(
   db: SupabaseClient,
   accountId: string,
@@ -146,7 +94,7 @@ export async function planBroadcastResume(
 ): Promise<ResumePlan> {
   const { data: broadcast, error: bcError } = await db
     .from('broadcasts')
-    .select('id, template_name, template_language')
+    .select('id, template_name, template_language, whatsapp_config_id')
     .eq('id', broadcastId)
     .eq('account_id', accountId)
     .maybeSingle();
@@ -154,15 +102,22 @@ export async function planBroadcastResume(
   if (bcError || !broadcast) {
     throw new BroadcastError('not_found', 'Broadcast not found', 404);
   }
+  if (!broadcast.whatsapp_config_id) {
+    throw new BroadcastError(
+      'channel_required',
+      'This legacy broadcast is not bound to a WhatsApp channel and cannot be safely resumed.',
+      409,
+    );
+  }
 
+  const channelId = broadcast.whatsapp_config_id as string;
   const statuses = scopeStatuses(scope);
   const { data: rawRows, error: recError } = await db
     .from('broadcast_recipients')
-    .select('id, template_params, contact:contacts(phone)')
+    .select('id, template_params, whatsapp_config_id, contact:contacts(phone)')
     .eq('broadcast_id', broadcastId)
+    .eq('whatsapp_config_id', channelId)
     .in('status', statuses)
-    // Oldest first, so repeated capped passes chew through the backlog
-    // in a stable order instead of re-picking the same slice.
     .order('created_at', { ascending: true });
 
   if (recError) {
@@ -171,10 +126,6 @@ export async function planBroadcastResume(
   }
 
   const rows = (rawRows ?? []) as RecipientRow[];
-
-  // A recipient whose contact has no usable phone can never send. Stamp
-  // it failed now: leaving it 'pending' would keep the broadcast in
-  // 'sending' forever, which is the very symptom being fixed.
   const sendable: RecipientRow[] = [];
   const unsendable: string[] = [];
   for (const row of rows) {
@@ -189,7 +140,8 @@ export async function planBroadcastResume(
         status: 'failed',
         error_message: 'No valid phone number on contact',
       })
-      .in('id', unsendable);
+      .in('id', unsendable)
+      .eq('whatsapp_config_id', channelId);
   }
 
   const slice = sendable.slice(0, RESUME_MAX_PER_REQUEST);
@@ -207,13 +159,14 @@ export async function planBroadcastResume(
 
   const { data: config, error: configError } = await db
     .from('whatsapp_config')
-    .select('*')
+    .select('id,phone_number_id,access_token')
     .eq('account_id', accountId)
-    .single();
+    .eq('id', channelId)
+    .maybeSingle();
   if (configError || !config) {
     throw new BroadcastError(
       'whatsapp_not_configured',
-      'WhatsApp not configured. Please set up your WhatsApp integration first.',
+      'The WhatsApp channel used by this broadcast is no longer configured.',
       400
     );
   }
@@ -222,18 +175,27 @@ export async function planBroadcastResume(
     db,
     accountId,
     broadcast.template_name,
-    broadcast.template_language
+    broadcast.template_language,
+    channelId,
   );
   if (resolvedTemplate.malformed) {
     throw new BroadcastError(
       'template_malformed',
-      'Template row is malformed locally — run "Sync from Meta" in Settings to repair it before resuming.',
+      'Template row is malformed locally — sync this WhatsApp channel from Meta before resuming.',
       500
+    );
+  }
+  if (!resolvedTemplate.row) {
+    throw new BroadcastError(
+      'template_not_found',
+      'Template is no longer available on the WhatsApp channel used by this broadcast.',
+      400,
     );
   }
 
   const plan: BroadcastPlan = {
     broadcastId,
+    whatsappConfigId: channelId,
     templateName: broadcast.template_name,
     templateLanguage: resolvedTemplate.language,
     phoneNumberId: config.phone_number_id,
@@ -252,11 +214,6 @@ export async function planBroadcastResume(
   return { plan, remaining, unsendable: unsendable.length };
 }
 
-/**
- * Put the broadcast back into `sending` for the duration of the pass,
- * so the detail page reads as in-flight rather than as a finished
- * campaign that is quietly still working.
- */
 export async function markBroadcastSending(
   db: SupabaseClient,
   broadcastId: string
