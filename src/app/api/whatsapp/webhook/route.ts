@@ -105,9 +105,6 @@ export async function GET(request: Request) {
       return NextResponse.json({ error: 'Verification failed' }, { status: 403 })
     }
 
-    // Meta may verify the same app endpoint for several WABAs/numbers. Each
-    // channel owns its encrypted token, so matching any configured token is
-    // sufficient for the challenge handshake.
     for (const config of configs) {
       if (!config.verify_token) continue
       try {
@@ -197,9 +194,6 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
         continue
       }
 
-      // Resolve channel ONCE for the complete Meta change. Delivery statuses
-      // and inbound messages in the same change must never be matched by wamid
-      // alone because Meta ids can repeat across different phone numbers.
       const config = await resolveChannelByPhoneNumberId(phoneNumberId)
       if (!config) continue
 
@@ -425,13 +419,11 @@ async function processMessage(
   }
 
   const { contentText, mediaUrl, mediaType, interactiveReplyId } =
-    await parseMessageContent(
-      message,
-      accessToken,
-      config.mirror_inbound_media !== false
-        ? { accountId, channelId: config.id }
-        : null,
-    )
+    await parseMessageContent(message, accessToken, {
+      accountId,
+      channelId: config.id,
+      mirror: config.mirror_inbound_media !== false,
+    })
 
   let replyToInternalId: string | null = null
   if (message.context?.id) {
@@ -572,7 +564,7 @@ async function processMessage(
 async function parseMessageContent(
   message: WhatsAppMessage,
   accessToken: string,
-  mirror: { accountId: string; channelId: string } | null,
+  mediaContext: { accountId: string; channelId: string; mirror: boolean },
 ): Promise<{
   contentText: string | null
   mediaUrl: string | null
@@ -585,10 +577,10 @@ async function parseMessageContent(
   ): Promise<string | null> => {
     try {
       const info = await getMediaUrl({ mediaId, accessToken })
-      if (mirror) {
+      if (mediaContext.mirror) {
         const mirrored = await mirrorInboundMedia({
           storage: supabaseAdmin().storage,
-          accountId: mirror.accountId,
+          accountId: mediaContext.accountId,
           mediaId,
           downloadUrl: info.url,
           accessToken,
@@ -599,9 +591,7 @@ async function parseMessageContent(
         })
         if (mirrored) return mirrored
       }
-      return `/api/whatsapp/media/${mediaId}${
-        mirror ? `?channel_id=${encodeURIComponent(mirror.channelId)}` : ''
-      }`
+      return `/api/whatsapp/media/${mediaId}?channel_id=${encodeURIComponent(mediaContext.channelId)}`
     } catch (error) {
       console.error(`[webhook] failed to resolve media ${mediaId}:`, error)
       return null
@@ -762,6 +752,55 @@ async function findOrCreateConversation(
     return null
   }
   if (existingRows?.length) return { conversation: existingRows[0], created: false }
+
+  // Preserve pre-channel history. If migration 040 ran before WhatsApp was
+  // configured, the one legacy thread for this contact remains NULL-bound.
+  // Claim it for the first real channel instead of splitting the history.
+  const { data: legacyRows, error: legacyError } = await supabaseAdmin()
+    .from('conversations')
+    .select('*')
+    .eq('account_id', accountId)
+    .eq('contact_id', contactId)
+    .is('whatsapp_config_id', null)
+    .order('created_at', { ascending: true })
+    .limit(1)
+
+  if (legacyError) {
+    console.error('[webhook] legacy conversation lookup failed:', legacyError)
+    return null
+  }
+
+  if (legacyRows?.[0]) {
+    const legacy = legacyRows[0]
+    const { data: rebound, error: bindError } = await supabaseAdmin()
+      .from('conversations')
+      .update({ whatsapp_config_id: channelId, updated_at: new Date().toISOString() })
+      .eq('id', legacy.id)
+      .eq('account_id', accountId)
+      .is('whatsapp_config_id', null)
+      .select()
+      .maybeSingle()
+
+    if (!bindError && rebound) return { conversation: rebound, created: false }
+    if (bindError && !isUniqueViolation(bindError)) {
+      console.error('[webhook] legacy conversation bind failed:', bindError)
+      return null
+    }
+
+    const { data: racedExact, error: racedExactError } = await supabaseAdmin()
+      .from('conversations')
+      .select('*')
+      .eq('account_id', accountId)
+      .eq('contact_id', contactId)
+      .eq('whatsapp_config_id', channelId)
+      .order('created_at', { ascending: true })
+      .limit(1)
+    if (racedExactError) {
+      console.error('[webhook] raced conversation lookup failed:', racedExactError)
+      return null
+    }
+    if (racedExact?.length) return { conversation: racedExact[0], created: false }
+  }
 
   const { data: created, error } = await supabaseAdmin()
     .from('conversations')
