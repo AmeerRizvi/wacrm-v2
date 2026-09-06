@@ -1,12 +1,27 @@
 import { NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
-import { createClient as createAdminClient } from '@supabase/supabase-js'
+import { createClient as createAdminClient, type SupabaseClient } from '@supabase/supabase-js'
 import {
   registerPhoneNumber,
   subscribeWabaToApp,
   verifyPhoneNumber,
 } from '@/lib/whatsapp/meta-api'
 import { encrypt, decrypt } from '@/lib/whatsapp/encryption'
+import { requireRole, toErrorResponse } from '@/lib/auth/account'
+
+type StoredChannel = {
+  id: string
+  account_id: string
+  phone_number_id: string
+  waba_id: string | null
+  label: string | null
+  access_token: string
+  verify_token: string | null
+  registered_at: string | null
+  subscribed_apps_at: string | null
+  mirror_inbound_media: boolean
+  is_primary: boolean
+}
 
 async function resolveAccountId(
   supabase: Awaited<ReturnType<typeof createClient>>,
@@ -21,9 +36,8 @@ async function resolveAccountId(
   return data.account_id as string
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let _adminClient: any = null
-function supabaseAdmin() {
+let _adminClient: SupabaseClient | null = null
+function supabaseAdmin(): SupabaseClient {
   if (!_adminClient) {
     _adminClient = createAdminClient(
       process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -33,23 +47,26 @@ function supabaseAdmin() {
   return _adminClient
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-async function resolveChannel(supabase: any, accountId: string, id?: string | null) {
-  let query = supabase
+async function resolveChannel(
+  supabase: SupabaseClient,
+  accountId: string,
+  id?: string | null,
+) {
+  const query = supabase
     .from('whatsapp_config')
     .select('*')
     .eq('account_id', accountId)
 
   if (id) {
     const { data, error } = await query.eq('id', id).maybeSingle()
-    return { data, error }
+    return { data: data as StoredChannel | null, error }
   }
 
   const { data, error } = await query
     .order('is_primary', { ascending: false })
     .order('created_at', { ascending: true })
     .limit(1)
-  return { data: data?.[0] ?? null, error }
+  return { data: (data?.[0] as StoredChannel | undefined) ?? null, error }
 }
 
 async function authenticatedContext() {
@@ -191,15 +208,14 @@ export async function GET(request: Request) {
  * Create a new channel or update one channel when `id` is provided.
  * For an existing channel, access_token / verify_token may be left blank
  * to keep the encrypted value already stored in the database.
+ *
+ * Configuration writes require an admin before any Meta-side registration or
+ * WABA subscription call is attempted. RLS remains defense in depth.
  */
 export async function POST(request: Request) {
   try {
-    const ctx = await authenticatedContext()
-    if ('error' in ctx) {
-      return NextResponse.json({ error: ctx.error }, { status: ctx.status })
-    }
-    const { supabase, user, accountId } = ctx
-    const body = await request.json()
+    const { supabase, userId, accountId } = await requireRole('admin')
+    const body = (await request.json()) as Record<string, unknown>
     const {
       id,
       label,
@@ -210,18 +226,20 @@ export async function POST(request: Request) {
       pin,
       is_primary,
       mirror_inbound_media,
-    } = body as Record<string, unknown>
+    } = body
 
     if (typeof phone_number_id !== 'string' || !phone_number_id.trim()) {
       return NextResponse.json({ error: 'phone_number_id is required' }, { status: 400 })
     }
+    const phoneNumberId = phone_number_id.trim()
+
     if (pin !== undefined && pin !== null && pin !== '') {
       if (typeof pin !== 'string' || !/^\d{6}$/.test(pin)) {
         return NextResponse.json({ error: 'PIN must be exactly 6 digits.' }, { status: 400 })
       }
     }
 
-    let existing: Record<string, unknown> | null = null
+    let existing: StoredChannel | null = null
     if (typeof id === 'string' && id) {
       const { data, error } = await supabase
         .from('whatsapp_config')
@@ -231,14 +249,24 @@ export async function POST(request: Request) {
         .maybeSingle()
       if (error) return NextResponse.json({ error: 'Failed to load channel' }, { status: 500 })
       if (!data) return NextResponse.json({ error: 'WhatsApp channel not found' }, { status: 404 })
-      existing = data as Record<string, unknown>
+      existing = data as StoredChannel
+
+      if (existing.phone_number_id !== phoneNumberId) {
+        return NextResponse.json(
+          {
+            error:
+              'Phone Number ID cannot be changed on an existing channel. Add a new channel for a different WhatsApp number.',
+          },
+          { status: 409 },
+        )
+      }
     }
 
     // One Meta phone_number_id can belong to only one channel globally.
     const { data: claimedRows, error: claimedError } = await supabaseAdmin()
       .from('whatsapp_config')
       .select('id,account_id')
-      .eq('phone_number_id', phone_number_id.trim())
+      .eq('phone_number_id', phoneNumberId)
       .limit(2)
 
     if (claimedError) {
@@ -246,7 +274,8 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Failed to validate configuration' }, { status: 500 })
     }
     const conflict = (claimedRows ?? []).find(
-      (row: { id: string; account_id: string }) => row.account_id !== accountId || row.id !== existing?.id,
+      (row: { id: string; account_id: string }) =>
+        row.account_id !== accountId || row.id !== existing?.id,
     )
     if (conflict) {
       return NextResponse.json(
@@ -261,7 +290,7 @@ export async function POST(request: Request) {
       if (typeof access_token === 'string' && access_token.trim()) {
         plainAccessToken = access_token.trim()
         encryptedAccessToken = encrypt(plainAccessToken)
-      } else if (existing?.access_token && typeof existing.access_token === 'string') {
+      } else if (existing?.access_token) {
         encryptedAccessToken = existing.access_token
         plainAccessToken = decrypt(existing.access_token)
       } else {
@@ -280,7 +309,7 @@ export async function POST(request: Request) {
       encryptedVerifyToken =
         typeof verify_token === 'string' && verify_token.trim()
           ? encrypt(verify_token.trim())
-          : (existing?.verify_token as string | null | undefined) ?? null
+          : existing?.verify_token ?? null
     } catch (err) {
       console.error('[whatsapp/config POST] verify token encryption failed:', err)
       return NextResponse.json({ error: 'Failed to encrypt verify token.' }, { status: 500 })
@@ -289,7 +318,7 @@ export async function POST(request: Request) {
     let phoneInfo
     try {
       phoneInfo = await verifyPhoneNumber({
-        phoneNumberId: phone_number_id.trim(),
+        phoneNumberId,
         accessToken: plainAccessToken,
       })
     } catch (err) {
@@ -297,9 +326,8 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: `Meta API error: ${message}` }, { status: 400 })
     }
 
-    const sameRegisteredNumber =
-      existing?.phone_number_id === phone_number_id.trim() && existing?.registered_at != null
-    let registeredAt = (existing?.registered_at as string | null | undefined) ?? null
+    const sameRegisteredNumber = existing?.registered_at != null
+    let registeredAt = existing?.registered_at ?? null
     let registrationError: string | null = null
     let registrationSkipped = false
     const hasPin = typeof pin === 'string' && pin.length > 0
@@ -311,7 +339,7 @@ export async function POST(request: Request) {
       } else {
         try {
           await registerPhoneNumber({
-            phoneNumberId: phone_number_id.trim(),
+            phoneNumberId,
             accessToken: plainAccessToken,
             pin,
           })
@@ -323,7 +351,7 @@ export async function POST(request: Request) {
       }
     }
 
-    let subscribedAppsAt = (existing?.subscribed_apps_at as string | null | undefined) ?? null
+    let subscribedAppsAt = existing?.subscribed_apps_at ?? null
     if (typeof waba_id === 'string' && waba_id.trim()) {
       try {
         await subscribeWabaToApp({ wabaId: waba_id.trim(), accessToken: plainAccessToken })
@@ -336,23 +364,18 @@ export async function POST(request: Request) {
       }
     }
 
-    const { count } = await supabase
-      .from('whatsapp_config')
-      .select('id', { count: 'exact', head: true })
-      .eq('account_id', accountId)
-    const shouldBePrimary = existing?.is_primary === true || count === 0 || is_primary === true
-
+    const shouldBePrimary = existing?.is_primary === true || is_primary === true
     const displayPhone =
       phoneInfo && typeof phoneInfo === 'object' && 'display_phone_number' in phoneInfo
         ? String((phoneInfo as { display_phone_number?: unknown }).display_phone_number ?? '')
         : ''
     const baseRow = {
-      phone_number_id: phone_number_id.trim(),
+      phone_number_id: phoneNumberId,
       waba_id: typeof waba_id === 'string' && waba_id.trim() ? waba_id.trim() : null,
       label:
         typeof label === 'string' && label.trim()
           ? label.trim()
-          : ((existing?.label as string | undefined) || displayPhone || phone_number_id.trim()),
+          : existing?.label || displayPhone || phoneNumberId,
       access_token: encryptedAccessToken,
       verify_token: encryptedVerifyToken,
       status: registrationError ? 'disconnected' : 'connected',
@@ -363,7 +386,7 @@ export async function POST(request: Request) {
       mirror_inbound_media:
         typeof mirror_inbound_media === 'boolean'
           ? mirror_inbound_media
-          : (existing?.mirror_inbound_media as boolean | undefined) ?? true,
+          : existing?.mirror_inbound_media ?? true,
       updated_at: new Date().toISOString(),
     }
 
@@ -371,9 +394,9 @@ export async function POST(request: Request) {
     if (existing) {
       const { data, error } = await supabase
         .from('whatsapp_config')
-        .update(baseRow)
+        .update({ ...baseRow, ...(shouldBePrimary ? { is_primary: true } : {}) })
         .eq('account_id', accountId)
-        .eq('id', existing.id as string)
+        .eq('id', existing.id)
         .select('id')
         .single()
       if (error || !data) {
@@ -384,31 +407,19 @@ export async function POST(request: Request) {
     } else {
       const { data, error } = await supabase
         .from('whatsapp_config')
-        .insert({ account_id: accountId, user_id: user.id, is_primary: false, ...baseRow })
-        .select('id')
+        .insert({
+          account_id: accountId,
+          user_id: userId,
+          is_primary: shouldBePrimary,
+          ...baseRow,
+        })
+        .select('id,is_primary')
         .single()
       if (error || !data) {
         console.error('[whatsapp/config POST] insert failed:', error)
         return NextResponse.json({ error: 'Failed to save configuration' }, { status: 500 })
       }
       channelId = data.id
-    }
-
-    if (shouldBePrimary) {
-      // Partial unique index guarantees one primary. Demote first, then promote.
-      await supabase
-        .from('whatsapp_config')
-        .update({ is_primary: false })
-        .eq('account_id', accountId)
-        .neq('id', channelId)
-      const { error: primaryError } = await supabase
-        .from('whatsapp_config')
-        .update({ is_primary: true })
-        .eq('account_id', accountId)
-        .eq('id', channelId)
-      if (primaryError) {
-        console.error('[whatsapp/config POST] primary update failed:', primaryError)
-      }
     }
 
     return NextResponse.json({
@@ -421,17 +432,14 @@ export async function POST(request: Request) {
       phone_info: phoneInfo,
     })
   } catch (error) {
-    console.error('[whatsapp/config POST] unexpected error:', error)
-    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
+    return toErrorResponse(error)
   }
 }
 
 /** Lightweight metadata edits that do not require Meta credentials. */
 export async function PATCH(request: Request) {
   try {
-    const ctx = await authenticatedContext()
-    if ('error' in ctx) return NextResponse.json({ error: ctx.error }, { status: ctx.status })
-    const { supabase, accountId } = ctx
+    const { supabase, accountId } = await requireRole('admin')
     const body = (await request.json()) as {
       id?: string
       label?: string
@@ -440,21 +448,14 @@ export async function PATCH(request: Request) {
     }
     if (!body.id) return NextResponse.json({ error: 'id is required' }, { status: 400 })
 
-    const { data: channel } = await supabase
+    const { data: channel, error: loadError } = await supabase
       .from('whatsapp_config')
       .select('id')
       .eq('account_id', accountId)
       .eq('id', body.id)
       .maybeSingle()
+    if (loadError) return NextResponse.json({ error: 'Failed to load channel' }, { status: 500 })
     if (!channel) return NextResponse.json({ error: 'WhatsApp channel not found' }, { status: 404 })
-
-    if (body.is_primary === true) {
-      await supabase
-        .from('whatsapp_config')
-        .update({ is_primary: false })
-        .eq('account_id', accountId)
-        .neq('id', body.id)
-    }
 
     const update: Record<string, unknown> = { updated_at: new Date().toISOString() }
     if (typeof body.label === 'string' && body.label.trim()) update.label = body.label.trim()
@@ -471,23 +472,19 @@ export async function PATCH(request: Request) {
     if (error) return NextResponse.json({ error: 'Failed to update channel' }, { status: 500 })
     return NextResponse.json({ success: true })
   } catch (error) {
-    console.error('[whatsapp/config PATCH] unexpected error:', error)
-    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
+    return toErrorResponse(error)
   }
 }
 
-/** Delete one channel. Legacy no-id calls delete the current primary channel only. */
+/** Delete one unused channel. Historical references intentionally block deletion. */
 export async function DELETE(request: Request) {
   try {
-    const ctx = await authenticatedContext()
-    if ('error' in ctx) return NextResponse.json({ error: ctx.error }, { status: ctx.status })
-    const { supabase, accountId } = ctx
+    const { supabase, accountId } = await requireRole('admin')
     const id = new URL(request.url).searchParams.get('id')
     const { data: channel, error: loadError } = await resolveChannel(supabase, accountId, id)
     if (loadError) return NextResponse.json({ error: 'Failed to load channel' }, { status: 500 })
     if (!channel) return NextResponse.json({ error: 'WhatsApp channel not found' }, { status: 404 })
 
-    const wasPrimary = channel.is_primary === true
     const { error: deleteError } = await supabase
       .from('whatsapp_config')
       .delete()
@@ -495,28 +492,20 @@ export async function DELETE(request: Request) {
       .eq('id', channel.id)
     if (deleteError) {
       console.error('[whatsapp/config DELETE] delete failed:', deleteError)
-      return NextResponse.json({ error: 'Failed to delete configuration' }, { status: 500 })
-    }
-
-    if (wasPrimary) {
-      const { data: remaining } = await supabase
-        .from('whatsapp_config')
-        .select('id')
-        .eq('account_id', accountId)
-        .order('created_at', { ascending: true })
-        .limit(1)
-      if (remaining?.[0]) {
-        await supabase
-          .from('whatsapp_config')
-          .update({ is_primary: true })
-          .eq('account_id', accountId)
-          .eq('id', remaining[0].id)
+      if (deleteError.code === '23503') {
+        return NextResponse.json(
+          {
+            error:
+              'This channel has conversation, message, broadcast, or template history and cannot be deleted. Keep it as historical configuration instead.',
+          },
+          { status: 409 },
+        )
       }
+      return NextResponse.json({ error: 'Failed to delete configuration' }, { status: 500 })
     }
 
     return NextResponse.json({ success: true })
   } catch (error) {
-    console.error('[whatsapp/config DELETE] unexpected error:', error)
-    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
+    return toErrorResponse(error)
   }
 }
