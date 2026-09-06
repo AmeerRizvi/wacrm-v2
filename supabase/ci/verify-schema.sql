@@ -54,9 +54,22 @@ BEGIN
   IF to_regclass('public.message_templates_channel_name_language_key') IS NULL THEN
     RAISE EXCEPTION 'channel-scoped template uniqueness index is missing';
   END IF;
+  IF to_regclass('public.idx_one_active_run_per_conversation') IS NULL THEN
+    RAISE EXCEPTION 'conversation-scoped active Flow uniqueness index is missing';
+  END IF;
+  IF to_regclass('public.idx_one_active_run_per_contact') IS NOT NULL THEN
+    RAISE EXCEPTION 'legacy contact-scoped active Flow uniqueness index still exists';
+  END IF;
 
-  -- Hardening triggers discovered during second-pass audit. These are as
-  -- important as the columns: service-role webhook/worker writes bypass RLS.
+  -- Migration 042 must expose the channel-aware atomic broadcast RPC. This is
+  -- a SECURITY DEFINER function, so silently falling back to the pre-channel
+  -- signature would be a routing/tenant-safety regression.
+  IF to_regprocedure(
+    'public.create_broadcast_with_recipients(uuid,uuid,text,text,text,integer,uuid[],jsonb[],uuid)'
+  ) IS NULL THEN
+    RAISE EXCEPTION 'channel-aware atomic broadcast creation RPC is missing';
+  END IF;
+
   IF NOT EXISTS (
     SELECT 1 FROM pg_trigger
     WHERE tgname = 'enforce_waba_single_account' AND NOT tgisinternal
