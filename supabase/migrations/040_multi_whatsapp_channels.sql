@@ -125,7 +125,8 @@ CREATE INDEX IF NOT EXISTS idx_message_templates_whatsapp_config
 
 -- Migration 014 keyed templates to the original creator. Shared accounts and
 -- multiple WABAs need identity to be account + channel + name + language.
-DROP INDEX IF EXISTS message_templates_user_name_language_key;
+ALTER TABLE message_templates
+  DROP CONSTRAINT IF EXISTS message_templates_user_name_language_key;
 CREATE UNIQUE INDEX IF NOT EXISTS message_templates_channel_name_language_key
   ON message_templates (whatsapp_config_id, name, language)
   WHERE whatsapp_config_id IS NOT NULL;
