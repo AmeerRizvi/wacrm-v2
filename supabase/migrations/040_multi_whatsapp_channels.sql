@@ -10,7 +10,7 @@
 --   * an account may own many whatsapp_config rows;
 --   * at most one config per account is marked primary;
 --   * conversations remember the config/number they belong to;
---   * outbound messages and broadcasts can retain the sending config.
+--   * messages and broadcasts retain their sending/receiving config.
 --
 -- Existing installations are backfilled to their sole current config,
 -- preserving behaviour until a second number is connected.
@@ -126,6 +126,23 @@ WHERE b.account_id = wc.account_id
 
 CREATE INDEX IF NOT EXISTS idx_broadcasts_whatsapp_config
   ON broadcasts(whatsapp_config_id);
+
+-- Status callbacks identify a send by Meta message id, but Meta message ids
+-- are not globally unique across WhatsApp numbers. Stamp every recipient
+-- with its parent broadcast's channel so status mirroring can use the pair.
+ALTER TABLE broadcast_recipients
+  ADD COLUMN IF NOT EXISTS whatsapp_config_id UUID
+  REFERENCES whatsapp_config(id) ON DELETE SET NULL;
+
+UPDATE broadcast_recipients br
+SET whatsapp_config_id = b.whatsapp_config_id
+FROM broadcasts b
+WHERE br.broadcast_id = b.id
+  AND br.whatsapp_config_id IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_broadcast_recipients_wamid_channel
+  ON broadcast_recipients(whatsapp_message_id, whatsapp_config_id)
+  WHERE whatsapp_message_id IS NOT NULL;
 
 -- -----------------------------------------------------------------
 -- templates may be WABA/channel-specific. Existing rows inherit primary.
