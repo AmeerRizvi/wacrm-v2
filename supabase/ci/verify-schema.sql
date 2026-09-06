@@ -20,8 +20,6 @@ BEGIN
     RAISE EXCEPTION 'public.accounts is missing — migration 017 did not apply';
   END IF;
 
-  -- Multi-WhatsApp foundation (040): channel identity must exist on every
-  -- runtime object that routes traffic to or from Meta.
   IF NOT EXISTS (
     SELECT 1 FROM information_schema.columns
     WHERE table_schema='public' AND table_name='whatsapp_config' AND column_name='is_primary'
@@ -56,6 +54,48 @@ BEGIN
   IF to_regclass('public.message_templates_channel_name_language_key') IS NULL THEN
     RAISE EXCEPTION 'channel-scoped template uniqueness index is missing';
   END IF;
+
+  -- Hardening triggers discovered during second-pass audit. These are as
+  -- important as the columns: service-role webhook/worker writes bypass RLS.
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_trigger
+    WHERE tgname = 'prevent_whatsapp_channel_identity_change' AND NOT tgisinternal
+  ) THEN RAISE EXCEPTION 'phone-number identity protection trigger is missing'; END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_trigger
+    WHERE tgname = 'maintain_whatsapp_primary_channel' AND NOT tgisinternal
+  ) THEN RAISE EXCEPTION 'transactional primary-channel trigger is missing'; END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_trigger
+    WHERE tgname = 'promote_whatsapp_primary_after_delete' AND NOT tgisinternal
+  ) THEN RAISE EXCEPTION 'primary-channel delete promotion trigger is missing'; END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_trigger
+    WHERE tgname = 'inherit_message_whatsapp_channel' AND NOT tgisinternal
+  ) THEN RAISE EXCEPTION 'message/conversation channel consistency trigger is missing'; END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_trigger
+    WHERE tgname = 'enforce_conversation_whatsapp_channel_account' AND NOT tgisinternal
+  ) THEN RAISE EXCEPTION 'conversation tenant/channel guard is missing'; END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_trigger
+    WHERE tgname = 'inherit_recipient_whatsapp_channel' AND NOT tgisinternal
+  ) THEN RAISE EXCEPTION 'broadcast recipient/channel consistency trigger is missing'; END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_trigger
+    WHERE tgname = 'prevent_whatsapp_waba_change_with_templates' AND NOT tgisinternal
+  ) THEN RAISE EXCEPTION 'WABA/template identity protection trigger is missing'; END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_trigger
+    WHERE tgname = 'validate_broadcast_template_channel' AND NOT tgisinternal
+  ) THEN RAISE EXCEPTION 'broadcast template/channel validation trigger is missing'; END IF;
 
   RAISE NOTICE 'schema verification passed';
 END
