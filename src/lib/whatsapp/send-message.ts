@@ -5,18 +5,10 @@
 //
 // Given a conversation and message params, this:
 //   1. validates the params for the message type,
-//   2. loads the conversation + contact + WhatsApp config,
+//   2. loads the conversation + contact + WhatsApp channel,
 //   3. sends to Meta (with phone-variant retry + contact auto-fix),
 //   4. persists the message + updates the conversation,
 //   5. pauses any active Flow run for the contact (agent stepped in).
-//
-// It is transport-agnostic: it takes a `SupabaseClient` and an
-// `accountId` and throws `SendMessageError` on failure. The callers
-// own auth, rate-limiting, body parsing, and mapping the error to
-// their respective response shapes (internal `{ error }` vs the v1
-// envelope). Behaviour is identical to the original inline route —
-// this is a straight extraction so the public endpoint can reuse it
-// without duplicating ~250 lines of Meta plumbing.
 // ============================================================
 
 import type { SupabaseClient } from '@supabase/supabase-js';
@@ -57,11 +49,6 @@ export const VALID_MESSAGE_TYPES = [
   ...MEDIA_KINDS,
 ] as const;
 
-/**
- * Typed failure with a machine `code` and a suggested HTTP `status`.
- * Callers map it to their own response shape (`toErrorResponse` for
- * the dashboard route, the v1 envelope for the public endpoint).
- */
 export class SendMessageError extends Error {
   readonly code: string;
   readonly status: number;
@@ -97,21 +84,6 @@ export interface SendMessageResult {
   whatsappMessageId: string;
 }
 
-/**
- * Send a message in an existing conversation and persist it.
- *
- * `db` may be an RLS-scoped user client (dashboard) or the service-
- * role client (public API) — every query is filtered by `accountId`
- * either way, so tenancy holds regardless of which client is passed.
- */
-/**
- * Validate the message-shape params (type, required content, caption
- * cap) independently of any DB state, throwing `SendMessageError` on a
- * bad payload. Exported so a caller can reject a malformed request
- * *before* it finds-or-creates a contact/conversation — otherwise an
- * invalid payload leaves an orphan empty conversation behind. The send
- * core calls this too, so validation can't be skipped.
- */
 export function validateSendMessageParams(params: {
   messageType: string;
   contentText?: string | null;
@@ -152,8 +124,6 @@ export function validateSendMessageParams(params: {
     );
   }
 
-  // Interactive: validate the full structured payload against Meta's
-  // limits up front so a bad payload 400s before we touch Meta.
   if (messageType === 'interactive') {
     const result = validateInteractivePayload(interactivePayload);
     if (!result.ok) {
@@ -169,7 +139,6 @@ export function validateSendMessageParams(params: {
     );
   }
 
-  // Meta caps media captions at 1024 chars (audio carries none).
   if (
     isMediaKind &&
     messageType !== 'audio' &&
@@ -221,7 +190,9 @@ export async function sendMessageToConversation(
 
   const isMediaKind = (MEDIA_KINDS as readonly string[]).includes(messageType);
 
-  // Conversation + contact, account-scoped.
+  // Conversation + contact, account-scoped. The conversation owns channel
+  // selection: replies must always leave through the same WhatsApp number
+  // that owns the thread.
   const { data: conversation, error: convError } = await db
     .from('conversations')
     .select('*, contact:contacts(*)')
@@ -251,24 +222,41 @@ export async function sendMessageToConversation(
     );
   }
 
-  // WhatsApp config, account-scoped.
-  const { data: config, error: configError } = await db
-    .from('whatsapp_config')
-    .select('*')
-    .eq('account_id', accountId)
-    .single();
+  // Resolve the exact channel bound to the conversation. Legacy rows that
+  // have not been backfilled yet fall back to the account's primary channel.
+  let config: Record<string, any> | null = null;
+  let configError: { message?: string } | null = null;
+
+  if (conversation.whatsapp_config_id) {
+    const result = await db
+      .from('whatsapp_config')
+      .select('*')
+      .eq('id', conversation.whatsapp_config_id)
+      .eq('account_id', accountId)
+      .maybeSingle();
+    config = result.data;
+    configError = result.error;
+  } else {
+    const result = await db
+      .from('whatsapp_config')
+      .select('*')
+      .eq('account_id', accountId)
+      .eq('is_primary', true)
+      .maybeSingle();
+    config = result.data;
+    configError = result.error;
+  }
 
   if (configError || !config) {
     throw new SendMessageError(
       'whatsapp_not_configured',
-      'WhatsApp not configured. Please set up your WhatsApp integration first.',
+      'The WhatsApp channel for this conversation is not configured.',
       400
     );
   }
 
   const accessToken = decrypt(config.access_token);
 
-  // Self-heal legacy CBC ciphertexts. Fire-and-forget; idempotent.
   if (isLegacyFormat(config.access_token)) {
     void db
       .from('whatsapp_config')
@@ -284,9 +272,6 @@ export async function sendMessageToConversation(
       });
   }
 
-  // Resolve the reply target to its Meta message_id. The parent must
-  // belong to this same conversation — otherwise a caller could quote
-  // messages they can't see by guessing UUIDs.
   let contextMessageId: string | undefined;
   if (replyToMessageId) {
     const { data: parent, error: parentError } = await db
@@ -312,10 +297,6 @@ export async function sendMessageToConversation(
     }
   }
 
-  // Template row — needed for the send-builder's header + button
-  // components AND for the body we persist. The lookup tolerates the
-  // en / en_US split so a caller that omits the language still resolves
-  // a row (see resolveTemplateRow).
   let templateRow: MessageTemplate | null = null;
   let sendLanguage = templateLanguage || 'en_US';
   if (messageType === 'template' && templateName) {
@@ -339,7 +320,7 @@ export async function sendMessageToConversation(
   const attempt = async (phone: string): Promise<string> => {
     if (messageType === 'template') {
       const result = await sendTemplateMessage({
-        phoneNumberId: config.phone_number_id,
+        phoneNumberId: config!.phone_number_id,
         accessToken,
         to: phone,
         templateName: templateName!,
@@ -353,7 +334,7 @@ export async function sendMessageToConversation(
     }
     if (isMediaKind) {
       const result = await sendMediaMessage({
-        phoneNumberId: config.phone_number_id,
+        phoneNumberId: config!.phone_number_id,
         accessToken,
         to: phone,
         kind: messageType as MediaKind,
@@ -368,7 +349,7 @@ export async function sendMessageToConversation(
       const p = interactivePayload!;
       if (p.kind === 'buttons') {
         const result = await sendInteractiveButtons({
-          phoneNumberId: config.phone_number_id,
+          phoneNumberId: config!.phone_number_id,
           accessToken,
           to: phone,
           bodyText: p.body,
@@ -380,7 +361,7 @@ export async function sendMessageToConversation(
         return result.messageId;
       }
       const result = await sendInteractiveList({
-        phoneNumberId: config.phone_number_id,
+        phoneNumberId: config!.phone_number_id,
         accessToken,
         to: phone,
         bodyText: p.body,
@@ -393,7 +374,7 @@ export async function sendMessageToConversation(
       return result.messageId;
     }
     const result = await sendTextMessage({
-      phoneNumberId: config.phone_number_id,
+      phoneNumberId: config!.phone_number_id,
       accessToken,
       to: phone,
       text: contentText!,
@@ -402,9 +383,6 @@ export async function sendMessageToConversation(
     return result.messageId;
   };
 
-  // Send via Meta — retry across phone-number variants if Meta rejects
-  // with "recipient not in allowed list"; persist a working variant
-  // back to the contact so the next send goes straight through.
   let waMessageId = '';
   let workingPhone = sanitizedPhone;
   try {
@@ -447,16 +425,6 @@ export async function sendMessageToConversation(
       .eq('id', contact.id);
   }
 
-  // Persist the sent message. Field names MUST match the messages
-  // schema (see 001_initial_schema.sql).
-  // Interactive messages persist the body as content_text (so the
-  // conversation-list preview reads sensibly) plus the full structured
-  // payload so the thread can re-render the buttons / rows.
-  //
-  // Templates persist the *substituted* body. The composer pre-renders
-  // and posts it as contentText; every other caller (the public API,
-  // most importantly) sends none, and storing null there left the
-  // Inbox rendering an empty bubble — issue #483.
   const persistedText =
     messageType === 'interactive'
       ? interactivePayload!.body
@@ -472,6 +440,7 @@ export async function sendMessageToConversation(
     .from('messages')
     .insert({
       conversation_id: conversationId,
+      whatsapp_config_id: config.id,
       sender_type: 'agent',
       content_type: messageType,
       content_text: persistedText,
@@ -509,8 +478,6 @@ export async function sendMessageToConversation(
     })
     .eq('id', conversationId);
 
-  // Pause any active Flow run for this contact — the agent stepping in
-  // is the strongest "yield, human is here" signal. Best-effort.
   try {
     const { error: pauseErr } = await supabaseAdmin()
       .from('flow_runs')
