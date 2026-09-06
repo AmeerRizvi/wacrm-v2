@@ -57,6 +57,18 @@ const CATEGORIES = ['Marketing', 'Utility', 'Authentication'] as const;
 type HeaderFormat = 'none' | 'text' | 'image' | 'video' | 'document';
 const HEADER_FORMATS: HeaderFormat[] = ['none', 'text', 'image', 'video', 'document'];
 
+type ChannelTemplate = MessageTemplate & {
+  whatsapp_config_id?: string | null;
+};
+
+type ChannelMeta = {
+  id: string;
+  label: string | null;
+  phone_number_id: string;
+  waba_id: string | null;
+  is_primary: boolean;
+};
+
 const categoryColors: Record<string, string> = {
   Marketing: 'bg-purple-600/20 text-purple-400 border-purple-600/30',
   Utility: 'bg-blue-600/20 text-blue-400 border-blue-600/30',
@@ -130,30 +142,19 @@ export function TemplateManager() {
   const { user, loading: authLoading } = useAuth();
 
   const [loading, setLoading] = useState(true);
-  const [templates, setTemplates] = useState<MessageTemplate[]>([]);
+  const [templates, setTemplates] = useState<ChannelTemplate[]>([]);
+  const [channels, setChannels] = useState<ChannelMeta[]>([]);
+  const [selectedChannelId, setSelectedChannelId] = useState<string>('');
   const [dialogOpen, setDialogOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [form, setForm] = useState<TemplateFormData>(emptyForm);
-  // Non-null when the dialog is editing an existing row — switches the
-  // submit handler from POST /submit to PATCH /[id] and changes the
-  // dialog title + CTA. Set to the template id to pre-fill from a row.
   const [editingId, setEditingId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
-  // Template selected for the confirm-delete dialog. The destructive
-  // action goes through this two-step so a slip on the trash icon
-  // doesn't take the template off Meta as well as locally.
-  const [templateToDelete, setTemplateToDelete] =
-    useState<MessageTemplate | null>(null);
-  // Header-image upload (issue #230). Uploads to the account-scoped
-  // chat-media bucket and stores the public URL in header_media_url; the
-  // submit route turns that into a Meta Resumable-Upload handle.
+  const [templateToDelete, setTemplateToDelete] = useState<ChannelTemplate | null>(null);
   const [uploadingHeader, setUploadingHeader] = useState(false);
   const headerFileRef = useRef<HTMLInputElement>(null);
 
-  // Body variable indices — `[1, 2, 3]` for "{{1}} {{2}} {{3}}". We
-  // re-run the extractor on every render to keep the sample-value rows
-  // in sync with what the user typed.
   const bodyVarCount = useMemo(
     () => extractVariableIndices(form.body_text).length,
     [form.body_text],
@@ -166,8 +167,6 @@ export function TemplateManager() {
     [form.header_format, form.header_content],
   );
 
-  // Resize body_samples so it always has exactly bodyVarCount entries.
-  // (We mutate via setForm in an effect so React owns the state.)
   useEffect(() => {
     setForm((prev) => {
       if (prev.body_samples.length === bodyVarCount) return prev;
@@ -183,20 +182,53 @@ export function TemplateManager() {
       setLoading(false);
       return;
     }
-    fetchTemplates(user.id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [authLoading, user?.id]);
 
-  async function fetchTemplates(userId: string) {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch('/api/whatsapp/config?list=1', { cache: 'no-store' });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Failed to load WhatsApp channels');
+        if (cancelled) return;
+        const nextChannels = (data.channels ?? []) as ChannelMeta[];
+        setChannels(nextChannels);
+        setSelectedChannelId((current) => {
+          if (current && nextChannels.some((channel) => channel.id === current)) return current;
+          return nextChannels.find((channel) => channel.is_primary)?.id ?? nextChannels[0]?.id ?? '';
+        });
+        if (nextChannels.length === 0) setLoading(false);
+      } catch (err) {
+        if (!cancelled) {
+          console.error('Failed to load template channels:', err);
+          toast.error(err instanceof Error ? err.message : t('toastLoadFailed'));
+          setLoading(false);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [authLoading, user, t]);
+
+  useEffect(() => {
+    if (!selectedChannelId || !user) return;
+    void fetchTemplates(selectedChannelId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedChannelId, user?.id]);
+
+  async function fetchTemplates(channelId: string) {
     try {
       setLoading(true);
+      // RLS scopes the query to the shared account. Do not filter by user_id:
+      // templates created or synced by another admin belong to the workspace.
       const { data, error } = await supabase
         .from('message_templates')
         .select('*')
-        .eq('user_id', userId)
+        .eq('whatsapp_config_id', channelId)
         .order('created_at', { ascending: false });
       if (error) throw error;
-      setTemplates(data || []);
+      setTemplates((data as ChannelTemplate[] | null) ?? []);
     } catch (err) {
       console.error('Failed to fetch templates:', err);
       toast.error(t('toastLoadFailed'));
@@ -230,10 +262,12 @@ export function TemplateManager() {
       buttons: form.buttons.length > 0 ? form.buttons : undefined,
       sample_values:
         Object.keys(sample_values).length > 0 ? sample_values : undefined,
+      channel_id: selectedChannelId || undefined,
     };
   }
 
-  function openEdit(template: MessageTemplate) {
+  function openEdit(template: ChannelTemplate) {
+    if (template.whatsapp_config_id) setSelectedChannelId(template.whatsapp_config_id);
     setEditingId(template.id);
     setForm({
       name: template.name,
@@ -252,15 +286,17 @@ export function TemplateManager() {
   }
 
   function openCreate() {
+    if (!selectedChannelId) {
+      toast.error('Connect a WhatsApp channel before creating templates.');
+      return;
+    }
     setEditingId(null);
     setForm(emptyForm);
     setDialogOpen(true);
   }
 
   async function handleSubmit() {
-    // AUTHENTICATION is blocked by the persistent banner + disabled
-    // submit button; this is a defensive second line of defense.
-    if (form.category === 'Authentication') return;
+    if (form.category === 'Authentication' || !selectedChannelId) return;
     try {
       setSubmitting(true);
       const isEdit = editingId !== null;
@@ -278,9 +314,7 @@ export function TemplateManager() {
           data?.error || `${isEdit ? 'Edit' : 'Submit'} failed (HTTP ${res.status})`,
         );
       }
-      // Refresh first, then close — re-opening the dialog
-      // immediately should not show a stale list.
-      if (user) await fetchTemplates(user.id);
+      await fetchTemplates(selectedChannelId);
       toast.success(
         data.dry_run
           ? isEdit
@@ -302,10 +336,13 @@ export function TemplateManager() {
   }
 
   async function handleSyncFromMeta() {
-    if (!user) return;
+    if (!user || !selectedChannelId) return;
     setSyncing(true);
     try {
-      const res = await fetch('/api/whatsapp/templates/sync', { method: 'POST' });
+      const res = await fetch(
+        `/api/whatsapp/templates/sync?channel_id=${encodeURIComponent(selectedChannelId)}`,
+        { method: 'POST' },
+      );
       const data = await res.json();
       if (!res.ok) {
         throw new Error(data?.error || `Sync failed (HTTP ${res.status})`);
@@ -326,15 +363,9 @@ export function TemplateManager() {
         toast.error(t('toastSyncFailed', { preview: preview.join(', ') + suffix }));
       }
       if (data.truncated) {
-        // Use error (not warning) so the message survives long
-        // enough to read — sonner's `warning` auto-dismisses on
-        // the same short timer as `success`.
-        toast.error(
-          t('toastSyncTruncated'),
-          { duration: 10000 },
-        );
+        toast.error(t('toastSyncTruncated'), { duration: 10000 });
       }
-      await fetchTemplates(user.id);
+      await fetchTemplates(selectedChannelId);
     } catch (err) {
       console.error('Template sync error:', err);
       toast.error(err instanceof Error ? err.message : t('toastSyncError'));
@@ -348,9 +379,6 @@ export function TemplateManager() {
     if (!target || deletingId) return;
     setDeletingId(target.id);
     try {
-      // Route handler scopes the Meta delete via hsm_id (so sibling
-      // language variants survive) and falls through to remove the
-      // local row. Local-only rows skip the Meta call.
       const res = await fetch(`/api/whatsapp/templates/${target.id}`, {
         method: 'DELETE',
       });
@@ -359,8 +387,8 @@ export function TemplateManager() {
         throw new Error(data?.error || `Delete failed (HTTP ${res.status})`);
       }
       toast.success(t('toastDeleteSuccess'));
-      setTemplates((prev) => prev.filter((t) => t.id !== target.id));
       setTemplateToDelete(null);
+      if (selectedChannelId) await fetchTemplates(selectedChannelId);
     } catch (err) {
       console.error('Delete error:', err);
       toast.error(err instanceof Error ? err.message : t('toastDeleteError'));
@@ -369,12 +397,6 @@ export function TemplateManager() {
     }
   }
 
-  // The patch type unions every field across button variants. The
-  // conditional rendering below ensures only fields valid for the
-  // current button's `type` reach this function, so the runtime
-  // assertion + per-type spread preserves discriminated-union
-  // invariants without forcing every call site to thread the type
-  // through generics (which TS can't infer from a partial literal).
   type ButtonPatch = {
     text?: string;
     url?: string;
@@ -386,8 +408,6 @@ export function TemplateManager() {
       const current = prev.buttons[index];
       if (!current) return prev;
       const next = [...prev.buttons];
-      // Per-variant spread keeps the discriminant pinned. Switch
-      // exhaustiveness is enforced by TypeScript.
       switch (current.type) {
         case 'QUICK_REPLY':
           next[index] = {
@@ -481,23 +501,43 @@ export function TemplateManager() {
     }
   }
 
+  const selectedChannel = channels.find((channel) => channel.id === selectedChannelId) ?? null;
+
   return (
     <section className="animate-in fade-in-50 space-y-4 duration-200">
       <SettingsPanelHead
         title={t('title')}
         description={t('description')}
         action={
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <Select
+              value={selectedChannelId}
+              onValueChange={(value) => {
+                if (value) setSelectedChannelId(value);
+              }}
+            >
+              <SelectTrigger className="min-w-44 border-border bg-background text-foreground">
+                <SelectValue placeholder="Choose WhatsApp number" />
+              </SelectTrigger>
+              <SelectContent className="bg-popover border-border">
+                {channels.map((channel) => (
+                  <SelectItem key={channel.id} value={channel.id}>
+                    {channel.label || channel.phone_number_id}
+                    {channel.is_primary ? ' · Primary' : ''}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
             <Button
               variant="outline"
               onClick={handleSyncFromMeta}
-              disabled={syncing}
+              disabled={syncing || !selectedChannelId}
               title={t('syncTitle')}
             >
               <RefreshCw className={`size-4 ${syncing ? 'animate-spin' : ''}`} />
               {syncing ? t('syncing') : t('syncFromMeta')}
             </Button>
-            <Button onClick={openCreate}>
+            <Button onClick={openCreate} disabled={!selectedChannelId}>
               <Plus className="size-4" />
               {t('newTemplate')}
             </Button>
@@ -505,7 +545,20 @@ export function TemplateManager() {
         }
       />
 
-      {templates.length === 0 ? (
+      {selectedChannel && (
+        <p className="text-xs text-muted-foreground">
+          Managing templates for <span className="font-medium text-foreground">{selectedChannel.label || selectedChannel.phone_number_id}</span>
+          {selectedChannel.waba_id ? ` · WABA ${selectedChannel.waba_id}` : ' · WABA not configured'}
+        </p>
+      )}
+
+      {channels.length === 0 ? (
+        <Card>
+          <CardContent className="flex flex-col items-center justify-center py-12 text-center">
+            <p className="text-sm text-muted-foreground">Connect a WhatsApp number before managing templates.</p>
+          </CardContent>
+        </Card>
+      ) : templates.length === 0 ? (
         <Card>
           <CardContent className="flex flex-col items-center justify-center py-12 text-center">
             <p className="text-muted-foreground text-sm">{t('noTemplates')}</p>
@@ -647,6 +700,7 @@ export function TemplateManager() {
               {editingId
                 ? t('dialogEditDesc')
                 : t('dialogNewDesc')}
+              {selectedChannel ? ` · ${selectedChannel.label || selectedChannel.phone_number_id}` : ''}
             </DialogDescription>
           </DialogHeader>
 
@@ -735,12 +789,6 @@ export function TemplateManager() {
               <Select
                 value={form.header_format}
                 onValueChange={(val) =>
-                  // Preserve header_content, header_media_url, and
-                  // header_sample across format switches. The submit
-                  // payload builder only reads the field that matches
-                  // the active format, so an orphan value on a hidden
-                  // field is harmless — and keeping it lets the user
-                  // switch formats to compare without losing typing.
                   setForm({
                     ...form,
                     header_format: (val || 'none') as HeaderFormat,
@@ -948,9 +996,6 @@ export function TemplateManager() {
                         <Select
                           value={btn.type}
                           onValueChange={(val) => {
-                            // Same null guard as the Header Select
-                            // (per PR 148): @base-ui Select fires
-                            // onValueChange(null) on deselect.
                             if (!val) return;
                             changeButtonType(i, val as TemplateButton['type']);
                           }}
@@ -1063,7 +1108,7 @@ export function TemplateManager() {
             </Button>
             <Button
               onClick={handleSubmit}
-              disabled={submitting || form.category === 'Authentication'}
+              disabled={submitting || form.category === 'Authentication' || !selectedChannelId}
               className="bg-primary hover:bg-primary/90 text-primary-foreground"
             >
               {submitting ? (
@@ -1081,9 +1126,6 @@ export function TemplateManager() {
         </DialogContent>
       </Dialog>
 
-      {/* Confirm-delete dialog. Surfacing the meta_template_id case
-          separately so users understand a real Meta delete is happening,
-          not just a local cleanup. */}
       <Dialog
         open={templateToDelete !== null}
         onOpenChange={(open) => {
