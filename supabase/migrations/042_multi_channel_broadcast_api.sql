@@ -1,11 +1,8 @@
 -- ============================================================
 -- 042_multi_channel_broadcast_api.sql
 --
--- The API broadcast core uses an atomic SECURITY DEFINER RPC introduced in
--- migrations 037/038. That function pre-dates multi-channel support, so it
--- could not persist the caller's WhatsApp channel. Add an explicit overload
--- rather than weakening the 041 channel/template guards or relying on trigger
--- inference inside a privileged function.
+-- Add a channel-aware overload of the atomic broadcast creation RPC and
+-- validate every tenant-bearing argument inside the SECURITY DEFINER boundary.
 -- ============================================================
 
 CREATE OR REPLACE FUNCTION public.create_broadcast_with_recipients(
@@ -26,9 +23,26 @@ SET search_path = public
 AS $$
 DECLARE
   v_broadcast_id UUID;
+  v_contact_count INTEGER;
 BEGIN
-  -- SECURITY DEFINER bypasses RLS, so tenant/channel validation belongs here
-  -- too. The table triggers remain a second line of defense.
+  IF p_total_recipients < 1
+     OR cardinality(p_contact_ids) IS DISTINCT FROM p_total_recipients
+     OR cardinality(p_template_params) IS DISTINCT FROM p_total_recipients THEN
+    RAISE EXCEPTION 'Broadcast recipient arrays do not match total_recipients'
+      USING ERRCODE = '22023';
+  END IF;
+
+  -- Audit user must be a member of the tenant whose rows will be written.
+  IF NOT EXISTS (
+    SELECT 1
+    FROM profiles p
+    WHERE p.user_id = p_user_id
+      AND p.account_id = p_account_id
+  ) THEN
+    RAISE EXCEPTION 'Broadcast audit user does not belong to broadcast account'
+      USING ERRCODE = '23514';
+  END IF;
+
   IF NOT EXISTS (
     SELECT 1
     FROM whatsapp_config wc
@@ -48,6 +62,16 @@ BEGIN
       AND mt.language = p_template_language
   ) THEN
     RAISE EXCEPTION 'Broadcast template is not available on the selected WhatsApp channel'
+      USING ERRCODE = '23514';
+  END IF;
+
+  SELECT count(*) INTO v_contact_count
+  FROM contacts c
+  WHERE c.account_id = p_account_id
+    AND c.id = ANY(p_contact_ids);
+
+  IF v_contact_count IS DISTINCT FROM p_total_recipients THEN
+    RAISE EXCEPTION 'One or more broadcast contacts do not belong to broadcast account'
       USING ERRCODE = '23514';
   END IF;
 
