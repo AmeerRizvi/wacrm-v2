@@ -10,6 +10,7 @@ import { useRealtime } from "@/hooks/use-realtime";
 import { ConversationList } from "@/components/inbox/conversation-list";
 import { MessageThread } from "@/components/inbox/message-thread";
 import { ContactSidebar } from "@/components/inbox/contact-sidebar";
+import { ActiveConversationProvider } from "@/components/inbox/active-conversation-context";
 import { WifiOff } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -95,9 +96,6 @@ function InboxPageInner() {
     }
   }, []);
 
-  // Multi-channel connection health: the inbox is online when at least one
-  // channel is connected. Do not use maybeSingle() against whatsapp_config;
-  // multi-number accounts legitimately have several rows.
   useEffect(() => {
     let cancelled = false;
     void fetch("/api/whatsapp/config?list=1", { cache: "no-store" })
@@ -106,14 +104,18 @@ function InboxPageInner() {
         if (!response.ok) throw new Error(json.error || "Failed to read WhatsApp channels");
         if (!cancelled) {
           const channels = Array.isArray(json.channels) ? json.channels : [];
-          setWhatsappConnected(channels.some((channel: { status?: string }) => channel.status === "connected"));
+          setWhatsappConnected(
+            channels.some((channel: { status?: string }) => channel.status === "connected"),
+          );
         }
       })
       .catch((error) => {
         console.error("Failed to check WhatsApp connection:", error);
         if (!cancelled) setWhatsappConnected(false);
       });
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const handleMessageEvent = useCallback(
@@ -123,7 +125,9 @@ function InboxPageInner() {
         if (activeConversation?.id === newMessage.conversation_id) {
           setMessages((previous) => {
             if (previous.some((message) => message.id === newMessage.id)) return previous;
-            const withoutOptimistic = previous.filter((message) => !message.id.startsWith("temp-"));
+            const withoutOptimistic = previous.filter(
+              (message) => !message.id.startsWith("temp-"),
+            );
             return [...withoutOptimistic, newMessage];
           });
         }
@@ -136,9 +140,10 @@ function InboxPageInner() {
                     ...conversation,
                     last_message_text: newMessage.content_text ?? "",
                     last_message_at: newMessage.created_at,
-                    unread_count: activeConversation?.id === newMessage.conversation_id
-                      ? 0
-                      : conversation.unread_count + 1,
+                    unread_count:
+                      activeConversation?.id === newMessage.conversation_id
+                        ? 0
+                        : conversation.unread_count + 1,
                   }
                 : conversation,
             ),
@@ -178,7 +183,11 @@ function InboxPageInner() {
           setConversations((previous) =>
             previous.map((row) =>
               row.id === conversation.id
-                ? { ...row, ...conversation, unread_count: isActive ? 0 : conversation.unread_count }
+                ? {
+                    ...row,
+                    ...conversation,
+                    unread_count: isActive ? 0 : conversation.unread_count,
+                  }
                 : row,
             ),
           );
@@ -186,7 +195,9 @@ function InboxPageInner() {
           void hydrateConversation(conversation.id);
         }
         if (activeConversation?.id === conversation.id) {
-          setActiveConversation((previous) => previous ? { ...previous, ...conversation } : previous);
+          setActiveConversation((previous) =>
+            previous ? { ...previous, ...conversation } : previous,
+          );
         }
       }
     },
@@ -223,7 +234,13 @@ function InboxPageInner() {
   const handleConversationsLoaded = useCallback(
     (loaded: Conversation[]) => {
       setConversations(loaded);
-      if (!deepLinkConvId || autoSelectedForDeepLinkRef.current === deepLinkConvId || loaded.length === 0) return;
+      if (
+        !deepLinkConvId ||
+        autoSelectedForDeepLinkRef.current === deepLinkConvId ||
+        loaded.length === 0
+      ) {
+        return;
+      }
       autoSelectedForDeepLinkRef.current = deepLinkConvId;
       if (activeConversation?.id === deepLinkConvId) return;
       const match = loaded.find((conversation) => conversation.id === deepLinkConvId);
@@ -250,7 +267,9 @@ function InboxPageInner() {
       setMessages([]);
       setConversations((previous) =>
         previous.map((row) =>
-          row.id === conversation.id && row.unread_count > 0 ? { ...row, unread_count: 0 } : row,
+          row.id === conversation.id && row.unread_count > 0
+            ? { ...row, unread_count: 0 }
+            : row,
         ),
       );
       autoSelectedForDeepLinkRef.current = conversation.id;
@@ -269,23 +288,47 @@ function InboxPageInner() {
 
   const handleMessagesLoaded = useCallback((loaded: Message[]) => setMessages(loaded), []);
   const handleNewMessage = useCallback((message: Message) => {
-    setMessages((previous) => previous.some((row) => row.id === message.id) ? previous : [...previous, message]);
+    setMessages((previous) =>
+      previous.some((row) => row.id === message.id) ? previous : [...previous, message],
+    );
   }, []);
   const handleUpdateMessage = useCallback((id: string, updates: Partial<Message>) => {
-    setMessages((previous) => previous.map((message) => message.id === id ? { ...message, ...updates } : message));
+    setMessages((previous) =>
+      previous.map((message) => (message.id === id ? { ...message, ...updates } : message)),
+    );
   }, []);
-  const handleStatusChange = useCallback((conversationId: string, status: ConversationStatus) => {
-    setConversations((previous) => previous.map((conversation) => conversation.id === conversationId ? { ...conversation, status } : conversation));
-    if (activeConversation?.id === conversationId) {
-      setActiveConversation((previous) => previous ? { ...previous, status } : previous);
-    }
-  }, [activeConversation]);
-  const handleAssignChange = useCallback((conversationId: string, assignedAgentId: string | null) => {
-    setConversations((previous) => previous.map((conversation) => conversation.id === conversationId ? { ...conversation, assigned_agent_id: assignedAgentId ?? undefined } : conversation));
-    if (activeConversation?.id === conversationId) {
-      setActiveConversation((previous) => previous ? { ...previous, assigned_agent_id: assignedAgentId ?? undefined } : previous);
-    }
-  }, [activeConversation]);
+  const handleStatusChange = useCallback(
+    (conversationId: string, status: ConversationStatus) => {
+      setConversations((previous) =>
+        previous.map((conversation) =>
+          conversation.id === conversationId ? { ...conversation, status } : conversation,
+        ),
+      );
+      if (activeConversation?.id === conversationId) {
+        setActiveConversation((previous) => (previous ? { ...previous, status } : previous));
+      }
+    },
+    [activeConversation],
+  );
+  const handleAssignChange = useCallback(
+    (conversationId: string, assignedAgentId: string | null) => {
+      setConversations((previous) =>
+        previous.map((conversation) =>
+          conversation.id === conversationId
+            ? { ...conversation, assigned_agent_id: assignedAgentId ?? undefined }
+            : conversation,
+        ),
+      );
+      if (activeConversation?.id === conversationId) {
+        setActiveConversation((previous) =>
+          previous
+            ? { ...previous, assigned_agent_id: assignedAgentId ?? undefined }
+            : previous,
+        );
+      }
+    },
+    [activeConversation],
+  );
 
   const hasActiveConversation = Boolean(activeConversation);
 
@@ -299,7 +342,12 @@ function InboxPageInner() {
       )}
 
       <div className="flex flex-1 overflow-hidden">
-        <div className={cn("flex h-full flex-1 lg:flex-none", hasActiveConversation ? "hidden lg:flex" : "flex")}>
+        <div
+          className={cn(
+            "flex h-full flex-1 lg:flex-none",
+            hasActiveConversation ? "hidden lg:flex" : "flex",
+          )}
+        >
           <ConversationList
             activeConversationId={activeConversation?.id ?? null}
             onSelect={handleSelectConversation}
@@ -309,22 +357,29 @@ function InboxPageInner() {
           />
         </div>
 
-        <div className={cn("flex h-full min-w-0 flex-1 lg:flex", hasActiveConversation ? "flex" : "hidden lg:flex")}>
-          <MessageThread
-            conversation={activeConversation}
-            contact={activeContact}
-            messages={messages}
-            onMessagesLoaded={handleMessagesLoaded}
-            onNewMessage={handleNewMessage}
-            onUpdateMessage={handleUpdateMessage}
-            onStatusChange={handleStatusChange}
-            onAssignChange={handleAssignChange}
-            onBack={handleCloseConversation}
-            resyncToken={resyncToken}
-            onRefresh={handleManualRefresh}
-            contactPanelOpen={contactPanelOpen}
-            onToggleContactPanel={handleToggleContactPanel}
-          />
+        <div
+          className={cn(
+            "flex h-full min-w-0 flex-1 lg:flex",
+            hasActiveConversation ? "flex" : "hidden lg:flex",
+          )}
+        >
+          <ActiveConversationProvider conversationId={activeConversation?.id ?? null}>
+            <MessageThread
+              conversation={activeConversation}
+              contact={activeContact}
+              messages={messages}
+              onMessagesLoaded={handleMessagesLoaded}
+              onNewMessage={handleNewMessage}
+              onUpdateMessage={handleUpdateMessage}
+              onStatusChange={handleStatusChange}
+              onAssignChange={handleAssignChange}
+              onBack={handleCloseConversation}
+              resyncToken={resyncToken}
+              onRefresh={handleManualRefresh}
+              contactPanelOpen={contactPanelOpen}
+              onToggleContactPanel={handleToggleContactPanel}
+            />
+          </ActiveConversationProvider>
         </div>
 
         {contactPanelOpen && (
