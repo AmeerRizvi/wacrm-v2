@@ -64,32 +64,88 @@ async function upsertTemplateRow(
   return supabase.from('message_templates').insert(row).select().single()
 }
 
+async function siblingChannelIds(
+  supabase: SupabaseClient,
+  accountId: string,
+  config: ChannelConfig,
+): Promise<string[]> {
+  if (!config.waba_id) return [config.id]
+  const { data, error } = await supabase
+    .from('whatsapp_config')
+    .select('id')
+    .eq('account_id', accountId)
+    .eq('waba_id', config.waba_id)
+    .order('created_at', { ascending: true })
+  if (error) throw new Error(`Failed to resolve WABA channels: ${error.message}`)
+  const ids = (data ?? []).map((row) => row.id as string)
+  if (!ids.includes(config.id)) ids.push(config.id)
+  return ids
+}
+
 export async function POST(request: Request) {
   try {
     const { supabase, accountId, userId } = await requireRole('admin')
     let payload: TemplatePayload & { channel_id?: string; whatsapp_config_id?: string }
-    try { payload = (await request.json()) as TemplatePayload & { channel_id?: string; whatsapp_config_id?: string } }
-    catch { return NextResponse.json({ error: 'Invalid JSON body.' }, { status: 400 }) }
+    try {
+      payload = (await request.json()) as TemplatePayload & {
+        channel_id?: string
+        whatsapp_config_id?: string
+      }
+    } catch {
+      return NextResponse.json({ error: 'Invalid JSON body.' }, { status: 400 })
+    }
 
     if (payload.category === 'Authentication') {
-      return NextResponse.json({ error: 'AUTHENTICATION templates are not yet supported here — create them in Meta WhatsApp Manager and sync them.' }, { status: 400 })
+      return NextResponse.json(
+        {
+          error:
+            'AUTHENTICATION templates are not yet supported here — create them in Meta WhatsApp Manager and sync them.',
+        },
+        { status: 400 },
+      )
     }
-    try { validateTemplatePayload(payload) }
-    catch (e) { return NextResponse.json({ error: e instanceof Error ? e.message : 'Validation failed.' }, { status: 400 }) }
+    try {
+      validateTemplatePayload(payload)
+    } catch (e) {
+      return NextResponse.json(
+        { error: e instanceof Error ? e.message : 'Validation failed.' },
+        { status: 400 },
+      )
+    }
 
     const requestedChannelId = payload.channel_id || payload.whatsapp_config_id || null
     let config: ChannelConfig | null = null
     if (requestedChannelId) {
-      const result = await supabase.from('whatsapp_config').select('id,waba_id,access_token').eq('account_id', accountId).eq('id', requestedChannelId).maybeSingle()
+      const result = await supabase
+        .from('whatsapp_config')
+        .select('id,waba_id,access_token')
+        .eq('account_id', accountId)
+        .eq('id', requestedChannelId)
+        .maybeSingle()
       config = result.data as ChannelConfig | null
-      if (result.error || !config) return NextResponse.json({ error: 'WhatsApp channel not found.' }, { status: 404 })
+      if (result.error || !config) {
+        return NextResponse.json({ error: 'WhatsApp channel not found.' }, { status: 404 })
+      }
     } else {
-      const result = await supabase.from('whatsapp_config').select('id,waba_id,access_token').eq('account_id', accountId).order('is_primary', { ascending: false }).order('created_at', { ascending: true }).limit(1)
+      const result = await supabase
+        .from('whatsapp_config')
+        .select('id,waba_id,access_token')
+        .eq('account_id', accountId)
+        .order('is_primary', { ascending: false })
+        .order('created_at', { ascending: true })
+        .limit(1)
       config = (result.data?.[0] as ChannelConfig | undefined) ?? null
-      if (result.error || !config) return NextResponse.json({ error: 'WhatsApp not configured. Connect a channel first.' }, { status: 400 })
+      if (result.error || !config) {
+        return NextResponse.json(
+          { error: 'WhatsApp not configured. Connect a channel first.' },
+          { status: 400 },
+        )
+      }
     }
 
-    const dryRun = process.env.WHATSAPP_TEMPLATES_DRY_RUN === 'true' || process.env.WHATSAPP_TEMPLATES_DRY_RUN === '1'
+    const dryRun =
+      process.env.WHATSAPP_TEMPLATES_DRY_RUN === 'true' ||
+      process.env.WHATSAPP_TEMPLATES_DRY_RUN === '1'
     let metaTemplateId: string
     let metaStatus: string
 
@@ -97,38 +153,106 @@ export async function POST(request: Request) {
       metaTemplateId = `dry-run-${crypto.randomUUID()}`
       metaStatus = 'PENDING'
     } else {
-      if (!config.waba_id) return NextResponse.json({ error: 'WABA ID missing for this WhatsApp channel.' }, { status: 400 })
+      if (!config.waba_id) {
+        return NextResponse.json(
+          { error: 'WABA ID missing for this WhatsApp channel.' },
+          { status: 400 },
+        )
+      }
       const accessToken = decrypt(config.access_token)
-      try { await ensureImageHeaderHandle(payload, accessToken) }
-      catch (e) { return NextResponse.json({ error: e instanceof Error ? e.message : 'Header image upload failed.' }, { status: 400 }) }
+      try {
+        await ensureImageHeaderHandle(payload, accessToken)
+      } catch (e) {
+        return NextResponse.json(
+          { error: e instanceof Error ? e.message : 'Header image upload failed.' },
+          { status: 400 },
+        )
+      }
       const metaPayload = buildMetaTemplatePayload(payload)
       try {
-        const meta = await submitMessageTemplate({ wabaId: config.waba_id, accessToken, payload: metaPayload })
+        const meta = await submitMessageTemplate({
+          wabaId: config.waba_id,
+          accessToken,
+          payload: metaPayload,
+        })
         metaTemplateId = meta.id
         metaStatus = meta.status
       } catch (e) {
         const message = e instanceof Error ? e.message : 'Meta submit failed.'
-        await upsertTemplateRow(supabase, config.id, buildUpsertRow(accountId, userId, config.id, payload, { status: 'DRAFT', metaTemplateId: null, submissionError: message }))
+        await upsertTemplateRow(
+          supabase,
+          config.id,
+          buildUpsertRow(accountId, userId, config.id, payload, {
+            status: 'DRAFT',
+            metaTemplateId: null,
+            submissionError: message,
+          }),
+        )
         const isRateLimit = /\b429\b/.test(message)
-        return NextResponse.json({ error: isRateLimit ? 'Meta rate limit hit (100 template creates per hour). Try again later.' : message }, { status: isRateLimit ? 429 : 502 })
+        return NextResponse.json(
+          {
+            error: isRateLimit
+              ? 'Meta rate limit hit (100 template creates per hour). Try again later.'
+              : message,
+          },
+          { status: isRateLimit ? 429 : 502 },
+        )
       }
     }
 
-    const { data: row, error } = await upsertTemplateRow(
-      supabase,
-      config.id,
-      buildUpsertRow(accountId, userId, config.id, payload, {
-        status: normalizeStatus(metaStatus),
-        metaTemplateId,
-        submissionError: null,
-      }),
-    )
-    if (error) return NextResponse.json({ error: `Submitted to Meta but failed to save locally: ${error.message}. Sync from Meta to recover.`, meta_template_id: metaTemplateId }, { status: 500 })
+    // A successful Meta template belongs to the WABA. Mirror its local row to
+    // every phone channel in this workspace using that WABA so inbox/broadcast
+    // sends can still resolve templates deterministically by channel.
+    const targetChannelIds = await siblingChannelIds(supabase, accountId, config)
+    let selectedRow: unknown = null
+    const saveErrors: { channel_id: string; message: string }[] = []
 
-    return NextResponse.json({ success: true, channel_id: config.id, template: row, dry_run: dryRun })
+    for (const channelId of targetChannelIds) {
+      const { data, error } = await upsertTemplateRow(
+        supabase,
+        channelId,
+        buildUpsertRow(accountId, userId, channelId, payload, {
+          status: normalizeStatus(metaStatus),
+          metaTemplateId,
+          submissionError: null,
+        }),
+      )
+      if (error) {
+        saveErrors.push({ channel_id: channelId, message: error.message })
+      } else if (channelId === config.id) {
+        selectedRow = data
+      }
+    }
+
+    if (saveErrors.length > 0) {
+      return NextResponse.json(
+        {
+          error:
+            'Submitted to Meta but one or more local WABA channel copies failed to save. Sync from Meta to recover.',
+          meta_template_id: metaTemplateId,
+          channel_ids: targetChannelIds,
+          save_errors: saveErrors,
+        },
+        { status: 500 },
+      )
+    }
+
+    return NextResponse.json({
+      success: true,
+      channel_id: config.id,
+      waba_id: config.waba_id,
+      channel_ids: targetChannelIds,
+      template: selectedRow,
+      dry_run: dryRun,
+    })
   } catch (error) {
-    if (error instanceof UnauthorizedError || error instanceof ForbiddenError) return toErrorResponse(error)
+    if (error instanceof UnauthorizedError || error instanceof ForbiddenError) {
+      return toErrorResponse(error)
+    }
     console.error('Error submitting template:', error)
-    return NextResponse.json({ error: error instanceof Error ? error.message : 'Failed to submit template.' }, { status: 500 })
+    return NextResponse.json(
+      { error: error instanceof Error ? error.message : 'Failed to submit template.' },
+      { status: 500 },
+    )
   }
 }
