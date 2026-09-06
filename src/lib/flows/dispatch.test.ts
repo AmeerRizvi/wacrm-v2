@@ -1,22 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-// ============================================================
-// Entry-trigger dispatch (issue #490).
-//
-// Drives the real `dispatchInboundToFlows` against a fake Supabase so
-// the assertion is "a run was actually started", not "a helper returned
-// true". The bug was that a button tap never reached the keyword
-// matcher at all, so a helper-level test would have missed it.
-// ============================================================
-
 const h = vi.hoisted(() => ({
   state: {
-    /** Rows loadActiveRunForContact sees. Empty = no run in progress. */
     activeRuns: [] as unknown[],
     flows: [] as unknown[],
     nodes: [] as unknown[],
+    conversations: [] as unknown[],
     inserted: [] as { table: string; row: Record<string, unknown> }[],
-    /** Set by the flow_runs INSERT; what its .maybeSingle() returns. */
     insertedRun: null as Record<string, unknown> | null,
     rpcCalls: [] as string[],
   },
@@ -27,6 +17,7 @@ vi.mock("./admin-client", () => {
     if (table === "flow_runs") return h.state.activeRuns;
     if (table === "flows") return h.state.flows;
     if (table === "flow_nodes") return h.state.nodes;
+    if (table === "conversations") return h.state.conversations;
     return [];
   }
 
@@ -51,8 +42,6 @@ vi.mock("./admin-client", () => {
         }
         return b;
       },
-      // Only reached on the INSERT ... SELECT for a new run, and on
-      // loadFlow's flows lookup.
       maybeSingle: async () => ({
         data:
           table === "flow_runs" ? h.state.insertedRun : (rows(table)[0] ?? null),
@@ -144,16 +133,22 @@ function dispatch(message: ParsedInbound) {
   });
 }
 
-/** flow_runs INSERTs made during a dispatch. */
 function startedRuns() {
   return h.state.inserted.filter((i) => i.table === "flow_runs");
 }
 
 beforeEach(() => {
-  // No run in progress — the whole point is the entry-trigger path.
   h.state.activeRuns = [];
   h.state.flows = [];
   h.state.nodes = NODES;
+  h.state.conversations = [
+    {
+      id: "cv-1",
+      account_id: "acct-1",
+      contact_id: "ct-1",
+      whatsapp_config_id: "wa-1",
+    },
+  ];
   h.state.inserted = [];
   h.state.insertedRun = null;
   h.state.rpcCalls = [];
@@ -213,15 +208,10 @@ describe("dispatchInboundToFlows — entry triggers (#490)", () => {
       meta_message_id: "m1",
     });
 
-    // Before the fix this returned {consumed: false, outcome: "no_match"}
-    // — the tap was rejected before the keyword matcher ever ran.
     expect(result.consumed).toBe(true);
     expect(result.flow_run_id).toBe("run-1");
-    expect(
-      h.state.inserted.filter((i) => i.table === "flow_runs"),
-    ).toHaveLength(1);
+    expect(startedRuns()).toHaveLength(1);
     expect(h.state.rpcCalls).toContain("increment_flow_execution_count");
-    // The flow really ran, not just got created.
     expect(engineSendText).toHaveBeenCalledTimes(1);
   });
 
@@ -242,7 +232,7 @@ describe("dispatchInboundToFlows — entry triggers (#490)", () => {
     expect(startedRuns()).toHaveLength(1);
   });
 
-  it("still starts the same flow for the typed text (unchanged path)", async () => {
+  it("still starts the same flow for typed text", async () => {
     h.state.flows = [KEYWORD_FLOW];
 
     const result = await dispatch({
@@ -266,11 +256,9 @@ describe("dispatchInboundToFlows — entry triggers (#490)", () => {
       meta_message_id: "m1",
     });
 
-    // consumed:false is what lets the webhook fire the
-    // `interactive_reply` automation trigger instead.
     expect(result.consumed).toBe(false);
     expect(result.outcome).toBe("no_match");
-    expect(h.state.inserted.filter((i) => i.table === "flow_runs")).toEqual([]);
+    expect(startedRuns()).toEqual([]);
   });
 
   it("does not start a manual-trigger flow from a tap", async () => {
@@ -309,11 +297,22 @@ describe("dispatchInboundToFlows — entry triggers (#490)", () => {
       isFirstInboundMessage: true,
     });
 
-    // A broadcast template's quick-reply button can genuinely be a
-    // contact's first-ever inbound; the automations side already
-    // treated it that way.
     expect(result.consumed).toBe(true);
     expect(result.flow_run_id).toBe("run-1");
     expect(startedRuns()).toHaveLength(1);
+  });
+
+  it("refuses a forged conversation/contact pairing before starting a run", async () => {
+    h.state.flows = [KEYWORD_FLOW];
+    h.state.conversations = [];
+
+    const result = await dispatch({
+      kind: "text",
+      text: "order status",
+      meta_message_id: "m1",
+    });
+
+    expect(result).toEqual({ consumed: false, outcome: "no_match" });
+    expect(startedRuns()).toEqual([]);
   });
 });
