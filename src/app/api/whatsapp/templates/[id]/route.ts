@@ -9,9 +9,19 @@ import { ensureImageHeaderHandle } from '@/lib/whatsapp/template-header-handle'
 
 const EDITABLE_STATUSES = new Set(['APPROVED', 'REJECTED', 'PAUSED'])
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
-function isDryRun() { return process.env.WHATSAPP_TEMPLATES_DRY_RUN === 'true' || process.env.WHATSAPP_TEMPLATES_DRY_RUN === '1' }
 
-async function loadTemplateAndChannel(supabase: SupabaseClient, accountId: string, id: string) {
+function isDryRun() {
+  return (
+    process.env.WHATSAPP_TEMPLATES_DRY_RUN === 'true' ||
+    process.env.WHATSAPP_TEMPLATES_DRY_RUN === '1'
+  )
+}
+
+async function loadTemplateAndChannel(
+  supabase: SupabaseClient,
+  accountId: string,
+  id: string,
+) {
   const { data: template, error } = await supabase
     .from('message_templates')
     .select('id,name,status,meta_template_id,language,whatsapp_config_id')
@@ -22,45 +32,134 @@ async function loadTemplateAndChannel(supabase: SupabaseClient, accountId: strin
 
   let config = null
   if (template.whatsapp_config_id) {
-    const result = await supabase.from('whatsapp_config').select('*').eq('account_id', accountId).eq('id', template.whatsapp_config_id).maybeSingle()
+    const result = await supabase
+      .from('whatsapp_config')
+      .select('*')
+      .eq('account_id', accountId)
+      .eq('id', template.whatsapp_config_id)
+      .maybeSingle()
     config = result.data
   } else {
-    const result = await supabase.from('whatsapp_config').select('*').eq('account_id', accountId).order('is_primary', { ascending: false }).order('created_at', { ascending: true }).limit(1)
+    const result = await supabase
+      .from('whatsapp_config')
+      .select('*')
+      .eq('account_id', accountId)
+      .order('is_primary', { ascending: false })
+      .order('created_at', { ascending: true })
+      .limit(1)
     config = result.data?.[0] ?? null
   }
   return { template, config }
 }
 
-export async function PATCH(request: Request, context: { params: Promise<{ id: string }> }) {
+async function wabaChannelIds(
+  supabase: SupabaseClient,
+  accountId: string,
+  config: { id: string; waba_id?: string | null } | null,
+): Promise<string[]> {
+  if (!config) return []
+  if (!config.waba_id) return [config.id]
+  const { data, error } = await supabase
+    .from('whatsapp_config')
+    .select('id')
+    .eq('account_id', accountId)
+    .eq('waba_id', config.waba_id)
+  if (error) throw new Error(`Failed to resolve WABA channels: ${error.message}`)
+  const ids = (data ?? []).map((row) => row.id as string)
+  if (!ids.includes(config.id)) ids.push(config.id)
+  return ids
+}
+
+export async function PATCH(
+  request: Request,
+  context: { params: Promise<{ id: string }> },
+) {
   try {
     const { id } = await context.params
-    if (!UUID_RE.test(id)) return NextResponse.json({ error: 'Invalid template id.' }, { status: 400 })
+    if (!UUID_RE.test(id)) {
+      return NextResponse.json({ error: 'Invalid template id.' }, { status: 400 })
+    }
     const { supabase, accountId } = await requireRole('admin')
     let payload: TemplatePayload
-    try { payload = (await request.json()) as TemplatePayload } catch { return NextResponse.json({ error: 'Invalid JSON body.' }, { status: 400 }) }
+    try {
+      payload = (await request.json()) as TemplatePayload
+    } catch {
+      return NextResponse.json({ error: 'Invalid JSON body.' }, { status: 400 })
+    }
 
     const { template: existing, config } = await loadTemplateAndChannel(supabase, accountId, id)
     if (!existing) return NextResponse.json({ error: 'Template not found.' }, { status: 404 })
-    if (!existing.meta_template_id) return NextResponse.json({ error: 'This template was never submitted to Meta.' }, { status: 400 })
-    if (!EDITABLE_STATUSES.has(existing.status)) return NextResponse.json({ error: `Templates in status ${existing.status} cannot be edited.` }, { status: 400 })
-    if (payload.category === 'Authentication') return NextResponse.json({ error: 'AUTHENTICATION templates are not editable here.' }, { status: 400 })
-    try { validateTemplatePayload(payload) } catch (e) { return NextResponse.json({ error: e instanceof Error ? e.message : 'Validation failed.' }, { status: 400 }) }
+    if (!existing.meta_template_id) {
+      return NextResponse.json(
+        { error: 'This template was never submitted to Meta.' },
+        { status: 400 },
+      )
+    }
+    if (!EDITABLE_STATUSES.has(existing.status)) {
+      return NextResponse.json(
+        { error: `Templates in status ${existing.status} cannot be edited.` },
+        { status: 400 },
+      )
+    }
+    if (payload.category === 'Authentication') {
+      return NextResponse.json(
+        { error: 'AUTHENTICATION templates are not editable here.' },
+        { status: 400 },
+      )
+    }
+    try {
+      validateTemplatePayload(payload)
+    } catch (e) {
+      return NextResponse.json(
+        { error: e instanceof Error ? e.message : 'Validation failed.' },
+        { status: 400 },
+      )
+    }
+
+    const siblingIds = await wabaChannelIds(supabase, accountId, config)
+    const targetIds = siblingIds.length
+      ? siblingIds
+      : existing.whatsapp_config_id
+        ? [existing.whatsapp_config_id]
+        : []
 
     if (!isDryRun()) {
-      if (!config) return NextResponse.json({ error: 'The WhatsApp channel for this template is not configured.' }, { status: 400 })
+      if (!config) {
+        return NextResponse.json(
+          { error: 'The WhatsApp channel for this template is not configured.' },
+          { status: 400 },
+        )
+      }
       const accessToken = decrypt(config.access_token)
-      try { await ensureImageHeaderHandle(payload, accessToken) } catch (e) { return NextResponse.json({ error: e instanceof Error ? e.message : 'Header image upload failed.' }, { status: 400 }) }
+      try {
+        await ensureImageHeaderHandle(payload, accessToken)
+      } catch (e) {
+        return NextResponse.json(
+          { error: e instanceof Error ? e.message : 'Header image upload failed.' },
+          { status: 400 },
+        )
+      }
       try {
         const metaPayload = buildMetaTemplatePayload(payload)
-        await editMessageTemplate({ metaTemplateId: existing.meta_template_id, accessToken, components: metaPayload.components })
+        await editMessageTemplate({
+          metaTemplateId: existing.meta_template_id,
+          accessToken,
+          components: metaPayload.components,
+        })
       } catch (e) {
         const message = e instanceof Error ? e.message : 'Meta edit failed.'
-        await supabase.from('message_templates').update({ submission_error: message, last_submitted_at: new Date().toISOString() }).eq('id', id)
+        let failedQuery = supabase
+          .from('message_templates')
+          .update({ submission_error: message, last_submitted_at: new Date().toISOString() })
+          .eq('account_id', accountId)
+          .eq('meta_template_id', existing.meta_template_id)
+        if (targetIds.length) failedQuery = failedQuery.in('whatsapp_config_id', targetIds)
+        await failedQuery
         return NextResponse.json({ error: message }, { status: 502 })
       }
     }
 
-    const { data: row, error } = await supabase.from('message_templates').update({
+    const update = {
       category: payload.category,
       header_type: payload.header_type ?? null,
       header_content: payload.header_content ?? null,
@@ -70,31 +169,110 @@ export async function PATCH(request: Request, context: { params: Promise<{ id: s
       footer_text: payload.footer_text ?? null,
       buttons: payload.buttons ?? null,
       sample_values: payload.sample_values ?? null,
-      status: 'PENDING', submission_error: null, rejection_reason: null,
+      status: 'PENDING',
+      submission_error: null,
+      rejection_reason: null,
       last_submitted_at: new Date().toISOString(),
-    }).eq('id', id).select().single()
-    if (error) return NextResponse.json({ error: `Edited on Meta but failed to save locally: ${error.message}` }, { status: 500 })
-    return NextResponse.json({ success: true, channel_id: existing.whatsapp_config_id ?? config?.id ?? null, template: row, dry_run: isDryRun() })
-  } catch (error) { return toErrorResponse(error) }
+    }
+
+    let updateQuery = supabase
+      .from('message_templates')
+      .update(update)
+      .eq('account_id', accountId)
+      .eq('meta_template_id', existing.meta_template_id)
+    if (targetIds.length) updateQuery = updateQuery.in('whatsapp_config_id', targetIds)
+    const { error } = await updateQuery
+    if (error) {
+      return NextResponse.json(
+        { error: `Edited on Meta but failed to save locally: ${error.message}` },
+        { status: 500 },
+      )
+    }
+
+    const { data: row, error: reloadError } = await supabase
+      .from('message_templates')
+      .select('*')
+      .eq('id', id)
+      .eq('account_id', accountId)
+      .single()
+    if (reloadError) {
+      return NextResponse.json(
+        { error: `Edited on Meta but failed to reload local row: ${reloadError.message}` },
+        { status: 500 },
+      )
+    }
+
+    return NextResponse.json({
+      success: true,
+      channel_id: existing.whatsapp_config_id ?? config?.id ?? null,
+      channel_ids: targetIds,
+      template: row,
+      dry_run: isDryRun(),
+    })
+  } catch (error) {
+    return toErrorResponse(error)
+  }
 }
 
-export async function DELETE(_request: Request, context: { params: Promise<{ id: string }> }) {
+export async function DELETE(
+  _request: Request,
+  context: { params: Promise<{ id: string }> },
+) {
   try {
     const { id } = await context.params
-    if (!UUID_RE.test(id)) return NextResponse.json({ error: 'Invalid template id.' }, { status: 400 })
+    if (!UUID_RE.test(id)) {
+      return NextResponse.json({ error: 'Invalid template id.' }, { status: 400 })
+    }
     const { supabase, accountId } = await requireRole('admin')
     const { template: existing, config } = await loadTemplateAndChannel(supabase, accountId, id)
     if (!existing) return NextResponse.json({ error: 'Template not found.' }, { status: 404 })
 
+    const siblingIds = await wabaChannelIds(supabase, accountId, config)
+    const targetIds = siblingIds.length
+      ? siblingIds
+      : existing.whatsapp_config_id
+        ? [existing.whatsapp_config_id]
+        : []
+
     if (existing.meta_template_id && !isDryRun()) {
-      if (!config?.waba_id) return NextResponse.json({ error: 'The template WhatsApp channel/WABA is not configured.' }, { status: 400 })
+      if (!config?.waba_id) {
+        return NextResponse.json(
+          { error: 'The template WhatsApp channel/WABA is not configured.' },
+          { status: 400 },
+        )
+      }
       try {
-        await deleteMessageTemplate({ wabaId: config.waba_id, accessToken: decrypt(config.access_token), name: existing.name, metaTemplateId: existing.meta_template_id })
-      } catch (e) { return NextResponse.json({ error: e instanceof Error ? e.message : 'Meta delete failed.' }, { status: 502 }) }
+        await deleteMessageTemplate({
+          wabaId: config.waba_id,
+          accessToken: decrypt(config.access_token),
+          name: existing.name,
+          metaTemplateId: existing.meta_template_id,
+        })
+      } catch (e) {
+        return NextResponse.json(
+          { error: e instanceof Error ? e.message : 'Meta delete failed.' },
+          { status: 502 },
+        )
+      }
     }
 
-    const { error } = await supabase.from('message_templates').delete().eq('id', id).eq('account_id', accountId)
-    if (error) return NextResponse.json({ error: `Deleted on Meta but failed locally: ${error.message}` }, { status: 500 })
-    return NextResponse.json({ success: true, dry_run: isDryRun() })
-  } catch (error) { return toErrorResponse(error) }
+    let deleteQuery = supabase.from('message_templates').delete().eq('account_id', accountId)
+    if (existing.meta_template_id) {
+      deleteQuery = deleteQuery.eq('meta_template_id', existing.meta_template_id)
+      if (targetIds.length) deleteQuery = deleteQuery.in('whatsapp_config_id', targetIds)
+    } else {
+      deleteQuery = deleteQuery.eq('id', id)
+    }
+
+    const { error } = await deleteQuery
+    if (error) {
+      return NextResponse.json(
+        { error: `Deleted on Meta but failed locally: ${error.message}` },
+        { status: 500 },
+      )
+    }
+    return NextResponse.json({ success: true, channel_ids: targetIds, dry_run: isDryRun() })
+  } catch (error) {
+    return toErrorResponse(error)
+  }
 }
