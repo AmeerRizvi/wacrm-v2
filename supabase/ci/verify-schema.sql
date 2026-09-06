@@ -61,9 +61,6 @@ BEGIN
     RAISE EXCEPTION 'legacy contact-scoped active Flow uniqueness index still exists';
   END IF;
 
-  -- Migration 042 must expose the channel-aware atomic broadcast RPC. This is
-  -- a SECURITY DEFINER function, so silently falling back to the pre-channel
-  -- signature would be a routing/tenant-safety regression.
   IF to_regprocedure(
     'public.create_broadcast_with_recipients(uuid,uuid,text,text,text,integer,uuid[],jsonb[],uuid)'
   ) IS NULL THEN
@@ -124,6 +121,16 @@ BEGIN
     SELECT 1 FROM pg_trigger
     WHERE tgname = 'validate_broadcast_template_channel' AND NOT tgisinternal
   ) THEN RAISE EXCEPTION 'broadcast template/channel validation trigger is missing'; END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_trigger
+    WHERE tgname = 'enforce_flow_run_conversation_identity' AND NOT tgisinternal
+  ) THEN RAISE EXCEPTION 'Flow run conversation tenant/contact guard is missing'; END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_trigger
+    WHERE tgname = 'enforce_broadcast_recipient_identity' AND NOT tgisinternal
+  ) THEN RAISE EXCEPTION 'broadcast recipient tenant/channel guard is missing'; END IF;
 
   RAISE NOTICE 'schema verification passed';
 END
