@@ -93,8 +93,87 @@ export function validateSendMessageParams(params: {
   if (isMediaKind && !mediaUrl) {
     throw new SendMessageError('bad_request', `media_url is required for ${messageType} messages`, 400);
   }
-  if (isMediaKind && messageType !== 'audio' && typeof contentText === 'string' && contentText.length > 1024) {
+  if (
+    isMediaKind &&
+    messageType !== 'audio' &&
+    typeof contentText === 'string' &&
+    contentText.length > 1024
+  ) {
     throw new SendMessageError('bad_request', 'Caption exceeds the 1024-character limit', 400);
+  }
+}
+
+async function bindLegacyConversationToChannel(
+  db: SupabaseClient,
+  accountId: string,
+  conversationId: string,
+  contactId: string,
+  channelId: string,
+): Promise<void> {
+  // If a channel-specific thread already exists, silently rebinding this old
+  // null-channel thread would create two histories for the same account/contact/
+  // channel. Stop before the Meta send and let the caller open the canonical
+  // thread instead.
+  const { data: conflict, error: conflictError } = await db
+    .from('conversations')
+    .select('id')
+    .eq('account_id', accountId)
+    .eq('contact_id', contactId)
+    .eq('whatsapp_config_id', channelId)
+    .neq('id', conversationId)
+    .limit(1)
+    .maybeSingle();
+  if (conflictError) {
+    throw new SendMessageError('db_error', 'Failed to bind legacy conversation to WhatsApp channel', 500);
+  }
+  if (conflict) {
+    throw new SendMessageError(
+      'conversation_channel_conflict',
+      'This legacy conversation cannot be assigned to the primary WhatsApp channel because a channel-specific thread already exists for this contact. Open that thread instead.',
+      409,
+    );
+  }
+
+  const { data: bound, error: bindError } = await db
+    .from('conversations')
+    .update({ whatsapp_config_id: channelId, updated_at: new Date().toISOString() })
+    .eq('id', conversationId)
+    .eq('account_id', accountId)
+    .is('whatsapp_config_id', null)
+    .select('id,whatsapp_config_id')
+    .maybeSingle();
+
+  if (bindError) {
+    // A competing request can create/bind the canonical channel conversation
+    // after the preflight check. Surface a conflict instead of sending first
+    // and discovering the uniqueness failure when persisting the message.
+    if (bindError.code === '23505') {
+      throw new SendMessageError(
+        'conversation_channel_conflict',
+        'A channel-specific conversation was created concurrently. Retry from the current conversation list.',
+        409,
+      );
+    }
+    throw new SendMessageError('db_error', 'Failed to bind legacy conversation to WhatsApp channel', 500);
+  }
+
+  if (!bound) {
+    const { data: current, error: currentError } = await db
+      .from('conversations')
+      .select('whatsapp_config_id')
+      .eq('id', conversationId)
+      .eq('account_id', accountId)
+      .maybeSingle();
+    if (currentError || !current) {
+      throw new SendMessageError('db_error', 'Failed to re-read legacy conversation channel', 500);
+    }
+    if (current.whatsapp_config_id !== channelId) {
+      throw new SendMessageError(
+        'conversation_channel_conflict',
+        'This conversation was assigned to another WhatsApp channel concurrently. Refresh the inbox before sending.',
+        409,
+      );
+    }
   }
 }
 
@@ -117,7 +196,9 @@ export async function sendMessageToConversation(
     replyToMessageId,
   } = params;
 
-  if (!conversationId) throw new SendMessageError('bad_request', 'conversation_id is required', 400);
+  if (!conversationId) {
+    throw new SendMessageError('bad_request', 'conversation_id is required', 400);
+  }
   validateSendMessageParams({ messageType, contentText, mediaUrl, templateName, interactivePayload });
   const isMediaKind = (MEDIA_KINDS as readonly string[]).includes(messageType);
 
@@ -127,12 +208,18 @@ export async function sendMessageToConversation(
     .eq('id', conversationId)
     .eq('account_id', accountId)
     .single();
-  if (convError || !conversation) throw new SendMessageError('not_found', 'Conversation not found', 404);
+  if (convError || !conversation) {
+    throw new SendMessageError('not_found', 'Conversation not found', 404);
+  }
 
   const contact = conversation.contact;
-  if (!contact?.phone) throw new SendMessageError('bad_request', 'Contact phone number not found', 400);
+  if (!contact?.phone) {
+    throw new SendMessageError('bad_request', 'Contact phone number not found', 400);
+  }
   const sanitizedPhone = sanitizePhoneForMeta(contact.phone);
-  if (!isValidE164(sanitizedPhone)) throw new SendMessageError('bad_request', 'Invalid phone number format', 400);
+  if (!isValidE164(sanitizedPhone)) {
+    throw new SendMessageError('bad_request', 'Invalid phone number format', 400);
+  }
 
   let config: WhatsAppChannel | null = null;
   let configError: { message?: string } | null = null;
@@ -156,14 +243,33 @@ export async function sendMessageToConversation(
     configError = result.error;
   }
   if (configError || !config) {
-    throw new SendMessageError('whatsapp_not_configured', 'The WhatsApp channel for this conversation is not configured.', 400);
+    throw new SendMessageError(
+      'whatsapp_not_configured',
+      'The WhatsApp channel for this conversation is not configured.',
+      400,
+    );
+  }
+
+  if (!conversation.whatsapp_config_id) {
+    await bindLegacyConversationToChannel(
+      db,
+      accountId,
+      conversationId,
+      contact.id,
+      config.id,
+    );
+    conversation.whatsapp_config_id = config.id;
   }
 
   const accessToken = decrypt(config.access_token);
   if (isLegacyFormat(config.access_token)) {
-    void db.from('whatsapp_config').update({ access_token: encrypt(accessToken) }).eq('id', config.id).then(({ error }: { error: { message: string } | null }) => {
-      if (error) console.warn('[send-message] access_token GCM upgrade failed:', error.message);
-    });
+    void db
+      .from('whatsapp_config')
+      .update({ access_token: encrypt(accessToken) })
+      .eq('id', config.id)
+      .then(({ error }: { error: { message: string } | null }) => {
+        if (error) console.warn('[send-message] access_token GCM upgrade failed:', error.message);
+      });
   }
 
   let contextMessageId: string | undefined;
@@ -175,7 +281,11 @@ export async function sendMessageToConversation(
       .eq('conversation_id', conversationId)
       .maybeSingle();
     if (parentError || !parent) {
-      throw new SendMessageError('bad_request', 'reply_to_message_id not found in this conversation', 400);
+      throw new SendMessageError(
+        'bad_request',
+        'reply_to_message_id not found in this conversation',
+        400,
+      );
     }
     if (parent.message_id) contextMessageId = parent.message_id;
   }
@@ -183,9 +293,19 @@ export async function sendMessageToConversation(
   let templateRow: MessageTemplate | null = null;
   let sendLanguage = templateLanguage || 'en_US';
   if (messageType === 'template' && templateName) {
-    const resolved = await resolveTemplateRow(db, accountId, templateName, templateLanguage, config.id);
+    const resolved = await resolveTemplateRow(
+      db,
+      accountId,
+      templateName,
+      templateLanguage,
+      config.id,
+    );
     if (resolved.malformed) {
-      throw new SendMessageError('template_malformed', 'Template row is malformed locally — sync this WhatsApp channel from Meta to repair it.', 500);
+      throw new SendMessageError(
+        'template_malformed',
+        'Template row is malformed locally — sync this WhatsApp channel from Meta to repair it.',
+        500,
+      );
     }
     templateRow = resolved.row;
     sendLanguage = resolved.language;
@@ -193,63 +313,73 @@ export async function sendMessageToConversation(
 
   const attempt = async (phone: string): Promise<string> => {
     if (messageType === 'template') {
-      return (await sendTemplateMessage({
-        phoneNumberId: config.phone_number_id,
-        accessToken,
-        to: phone,
-        templateName: templateName!,
-        language: sendLanguage,
-        template: templateRow ?? undefined,
-        messageParams: templateMessageParams ?? undefined,
-        params: templateParams || [],
-        contextMessageId,
-      })).messageId;
+      return (
+        await sendTemplateMessage({
+          phoneNumberId: config.phone_number_id,
+          accessToken,
+          to: phone,
+          templateName: templateName!,
+          language: sendLanguage,
+          template: templateRow ?? undefined,
+          messageParams: templateMessageParams ?? undefined,
+          params: templateParams || [],
+          contextMessageId,
+        })
+      ).messageId;
     }
     if (isMediaKind) {
-      return (await sendMediaMessage({
-        phoneNumberId: config.phone_number_id,
-        accessToken,
-        to: phone,
-        kind: messageType as MediaKind,
-        link: mediaUrl!,
-        caption: contentText || undefined,
-        filename: filename || undefined,
-        contextMessageId,
-      })).messageId;
+      return (
+        await sendMediaMessage({
+          phoneNumberId: config.phone_number_id,
+          accessToken,
+          to: phone,
+          kind: messageType as MediaKind,
+          link: mediaUrl!,
+          caption: contentText || undefined,
+          filename: filename || undefined,
+          contextMessageId,
+        })
+      ).messageId;
     }
     if (messageType === 'interactive') {
       const p = interactivePayload!;
       if (p.kind === 'buttons') {
-        return (await sendInteractiveButtons({
+        return (
+          await sendInteractiveButtons({
+            phoneNumberId: config.phone_number_id,
+            accessToken,
+            to: phone,
+            bodyText: p.body,
+            headerText: p.header || undefined,
+            footerText: p.footer || undefined,
+            buttons: p.buttons,
+            contextMessageId,
+          })
+        ).messageId;
+      }
+      return (
+        await sendInteractiveList({
           phoneNumberId: config.phone_number_id,
           accessToken,
           to: phone,
           bodyText: p.body,
+          buttonLabel: p.button_label,
           headerText: p.header || undefined,
           footerText: p.footer || undefined,
-          buttons: p.buttons,
+          sections: p.sections,
           contextMessageId,
-        })).messageId;
-      }
-      return (await sendInteractiveList({
+        })
+      ).messageId;
+    }
+    return (
+      await sendTextMessage({
         phoneNumberId: config.phone_number_id,
         accessToken,
         to: phone,
-        bodyText: p.body,
-        buttonLabel: p.button_label,
-        headerText: p.header || undefined,
-        footerText: p.footer || undefined,
-        sections: p.sections,
+        text: contentText!,
         contextMessageId,
-      })).messageId;
-    }
-    return (await sendTextMessage({
-      phoneNumberId: config.phone_number_id,
-      accessToken,
-      to: phone,
-      text: contentText!,
-      contextMessageId,
-    })).messageId;
+      })
+    ).messageId;
   };
 
   let waMessageId = '';
@@ -278,42 +408,63 @@ export async function sendMessageToConversation(
     await db.from('contacts').update({ phone: workingPhone }).eq('id', contact.id);
   }
 
-  const persistedText = messageType === 'interactive'
-    ? interactivePayload!.body
-    : messageType === 'template'
-      ? templateContentText(templateRow, templateBodyParams(templateParams, templateMessageParams), contentText)
-      : (contentText ?? null);
+  const persistedText =
+    messageType === 'interactive'
+      ? interactivePayload!.body
+      : messageType === 'template'
+        ? templateContentText(
+            templateRow,
+            templateBodyParams(templateParams, templateMessageParams),
+            contentText,
+          )
+        : (contentText ?? null);
 
-  const { data: messageRecord, error: msgError } = await db.from('messages').insert({
-    conversation_id: conversationId,
-    whatsapp_config_id: config.id,
-    sender_type: 'agent',
-    content_type: messageType,
-    content_text: persistedText,
-    media_url: mediaUrl || null,
-    template_name: templateName || null,
-    interactive_payload: messageType === 'interactive' ? interactivePayload : null,
-    message_id: waMessageId,
-    status: 'sent',
-    reply_to_message_id: replyToMessageId || null,
-  }).select().single();
+  const { data: messageRecord, error: msgError } = await db
+    .from('messages')
+    .insert({
+      conversation_id: conversationId,
+      whatsapp_config_id: config.id,
+      sender_type: 'agent',
+      content_type: messageType,
+      content_text: persistedText,
+      media_url: mediaUrl || null,
+      template_name: templateName || null,
+      interactive_payload: messageType === 'interactive' ? interactivePayload : null,
+      message_id: waMessageId,
+      status: 'sent',
+      reply_to_message_id: replyToMessageId || null,
+    })
+    .select()
+    .single();
   if (msgError) {
-    throw new SendMessageError('db_error', `Message sent to Meta but failed to save to DB: ${msgError.message}`, 500);
+    throw new SendMessageError(
+      'db_error',
+      `Message sent to Meta but failed to save to DB: ${msgError.message}`,
+      500,
+    );
   }
 
-  const lastMessageText = messageType === 'interactive'
-    ? interactivePayloadPreviewText(interactivePayload!)
-    : persistedText || `[${messageType}]`;
-  await db.from('conversations').update({
-    last_message_text: lastMessageText,
-    last_message_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
-  }).eq('id', conversationId);
+  const lastMessageText =
+    messageType === 'interactive'
+      ? interactivePayloadPreviewText(interactivePayload!)
+      : persistedText || `[${messageType}]`;
+  await db
+    .from('conversations')
+    .update({
+      last_message_text: lastMessageText,
+      last_message_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', conversationId);
 
   try {
     const { error: pauseErr } = await supabaseAdmin()
       .from('flow_runs')
-      .update({ status: 'paused_by_agent', ended_at: new Date().toISOString(), end_reason: 'agent_replied' })
+      .update({
+        status: 'paused_by_agent',
+        ended_at: new Date().toISOString(),
+        end_reason: 'agent_replied',
+      })
       .eq('account_id', accountId)
       .eq('conversation_id', conversationId)
       .eq('status', 'active');
