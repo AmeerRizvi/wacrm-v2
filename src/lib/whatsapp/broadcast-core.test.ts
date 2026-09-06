@@ -6,17 +6,28 @@ import {
   BroadcastError,
 } from './broadcast-core';
 
-// Contact resolution and token decryption are exercised elsewhere — stub
-// them so these tests focus on the persistence boundary.
 vi.mock('@/lib/whatsapp/encryption', () => ({
   decrypt: () => 'plain-access-token',
 }));
 vi.mock('@/lib/api/v1/contacts', () => ({
   findOrCreateContact: vi.fn(async () => ({ id: 'c1' })),
 }));
+vi.mock('@/lib/whatsapp/template-body', () => ({
+  resolveTemplateRow: vi.fn(async () => ({
+    row: {
+      id: 'tpl-1',
+      user_id: 'user',
+      name: 'promo',
+      language: 'en_US',
+      category: 'Marketing',
+      body_text: 'Hello',
+      created_at: '2026-01-01T00:00:00Z',
+    },
+    language: 'en_US',
+    malformed: false,
+  })),
+}));
 
-// These assertions all fire in the pure validation prologue, before
-// any Supabase call — a bare stub is enough.
 const db = {} as SupabaseClient;
 
 describe('createBroadcast validation', () => {
@@ -25,7 +36,7 @@ describe('createBroadcast validation', () => {
       createBroadcast(db, 'acc', 'user', {
         templateName: '',
         recipients: [{ to: '+14155550123' }],
-      })
+      }),
     ).rejects.toMatchObject({ code: 'bad_request', status: 400 });
   });
 
@@ -34,7 +45,7 @@ describe('createBroadcast validation', () => {
       createBroadcast(db, 'acc', 'user', {
         templateName: 'promo',
         recipients: [],
-      })
+      }),
     ).rejects.toBeInstanceOf(BroadcastError);
   });
 
@@ -43,41 +54,31 @@ describe('createBroadcast validation', () => {
       to: '+14155550123',
     }));
     await expect(
-      createBroadcast(db, 'acc', 'user', { templateName: 'promo', recipients })
+      createBroadcast(db, 'acc', 'user', { templateName: 'promo', recipients }),
     ).rejects.toMatchObject({ status: 400 });
   });
 });
 
-// Build a Supabase-shaped mock that gets createBroadcast past its config +
-// template lookups and into persistence. `rpcResult` is what the atomic
-// create_broadcast_with_recipients RPC returns.
 function makeDb(rpcResult: { data: unknown; error: unknown }) {
   const calls = {
-    rpc: [] as { name: string; args: unknown }[],
-    // Incremented if the OLD non-atomic path (a direct broadcasts /
-    // broadcast_recipients insert) is ever reached — it must not be.
+    rpc: [] as { name: string; args: Record<string, unknown> }[],
     usedDirectInsert: 0,
   };
+
   const database = {
     from(table: string) {
       if (table === 'whatsapp_config') {
-        return {
-          select: () => ({
-            eq: () => ({
-              single: () =>
-                Promise.resolve({
-                  data: { phone_number_id: 'pn-1', access_token: 'enc' },
-                  error: null,
-                }),
-            }),
-          }),
-        };
-      }
-      if (table === 'message_templates') {
         const chain: Record<string, unknown> = {
           select: () => chain,
           eq: () => chain,
-          maybeSingle: () => Promise.resolve({ data: null, error: null }),
+          maybeSingle: async () => ({
+            data: {
+              id: 'wa-1',
+              phone_number_id: 'pn-1',
+              access_token: 'enc',
+            },
+            error: null,
+          }),
         };
         return chain;
       }
@@ -94,7 +95,7 @@ function makeDb(rpcResult: { data: unknown; error: unknown }) {
       }
       throw new Error(`unexpected table: ${table}`);
     },
-    rpc(name: string, args: unknown) {
+    rpc(name: string, args: Record<string, unknown>) {
       calls.rpc.push({ name, args });
       return Promise.resolve(rpcResult);
     },
@@ -102,8 +103,8 @@ function makeDb(rpcResult: { data: unknown; error: unknown }) {
   return { db: database, calls };
 }
 
-describe('createBroadcast atomicity (#370)', () => {
-  it('creates parent + recipients through the atomic RPC, never a bare parent insert', async () => {
+describe('createBroadcast atomicity + channel identity', () => {
+  it('passes the selected channel into the atomic RPC', async () => {
     const { db, calls } = makeDb({
       data: [{ broadcast_id: 'b-1', recipient_id: 'r-1', contact_id: 'c1' }],
       error: null,
@@ -111,13 +112,16 @@ describe('createBroadcast atomicity (#370)', () => {
 
     const plan = await createBroadcast(db, 'acc', 'user', {
       templateName: 'promo',
+      channelId: 'wa-1',
       recipients: [{ to: '+14155550123' }],
     });
 
     expect(calls.rpc).toHaveLength(1);
     expect(calls.rpc[0].name).toBe('create_broadcast_with_recipients');
+    expect(calls.rpc[0].args.p_whatsapp_config_id).toBe('wa-1');
     expect(calls.usedDirectInsert).toBe(0);
     expect(plan.broadcastId).toBe('b-1');
+    expect(plan.whatsappConfigId).toBe('wa-1');
     expect(plan.planned).toEqual([
       { recipientRowId: 'r-1', phone: '14155550123', params: [] },
     ]);
@@ -132,24 +136,15 @@ describe('createBroadcast atomicity (#370)', () => {
     await expect(
       createBroadcast(db, 'acc', 'user', {
         templateName: 'promo',
+        channelId: 'wa-1',
         recipients: [{ to: '+14155550123' }],
-      })
+      }),
     ).rejects.toBeInstanceOf(BroadcastError);
 
-    // The RPC was the only persistence attempt; because it runs both
-    // inserts in a single transaction, its failure rolls the parent back —
-    // there is no separate parent insert that could survive as an orphan.
     expect(calls.rpc).toHaveLength(1);
     expect(calls.usedDirectInsert).toBe(0);
   });
 });
-
-// ============================================================
-// Terminal status (#472). Derived from the recipient rows, not from a
-// counter local to one delivery pass — a resume only sends the
-// leftovers, so "nothing sent this pass" must not condemn a campaign
-// that already delivered hundreds.
-// ============================================================
 
 function statusDb(
   counts: Record<string, number>,
@@ -181,10 +176,9 @@ function statusDb(
 }
 
 describe('finalizeBroadcastStatus', () => {
-  it('leaves a capped pass in "sending" while recipients are still pending', async () => {
+  it('leaves a capped pass in sending while recipients remain pending', async () => {
     const writes: { update?: Record<string, unknown> } = {};
     await finalizeBroadcastStatus(statusDb({ pending: 25 }, 1025, writes), 'b-1');
-    // No write at all — the UI keeps offering Resume.
     expect(writes.update).toBeUndefined();
   });
 
@@ -203,14 +197,11 @@ describe('finalizeBroadcastStatus', () => {
       statusDb({ pending: 0, failed: 3 }, 10, writes),
       'b-1',
     );
-    // 7 people got the message; failed_count carries the other 3.
     expect(writes.update?.status).toBe('sent');
   });
 
   it('does not condemn a campaign whose resume pass sent nothing new', async () => {
     const writes: { update?: Record<string, unknown> } = {};
-    // 800 delivered on the original pass, the 200-recipient resume all
-    // failed. Pre-fix this wrote 'failed' off a pass-local counter.
     await finalizeBroadcastStatus(
       statusDb({ pending: 0, failed: 200 }, 1000, writes),
       'b-1',
