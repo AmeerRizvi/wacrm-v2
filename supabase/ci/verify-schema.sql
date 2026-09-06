@@ -59,6 +59,11 @@ BEGIN
   -- important as the columns: service-role webhook/worker writes bypass RLS.
   IF NOT EXISTS (
     SELECT 1 FROM pg_trigger
+    WHERE tgname = 'enforce_waba_single_account' AND NOT tgisinternal
+  ) THEN RAISE EXCEPTION 'WABA tenant ownership trigger is missing'; END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_trigger
     WHERE tgname = 'prevent_whatsapp_channel_identity_change' AND NOT tgisinternal
   ) THEN RAISE EXCEPTION 'phone-number identity protection trigger is missing'; END IF;
 
