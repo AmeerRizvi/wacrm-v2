@@ -34,6 +34,42 @@ CREATE TRIGGER prevent_whatsapp_waba_change_with_templates
   BEFORE UPDATE OF waba_id ON whatsapp_config
   FOR EACH ROW EXECUTE FUNCTION public.prevent_whatsapp_waba_change_with_templates();
 
+-- Migration 040 can intentionally leave conversations NULL-bound when an old
+-- installation had no WhatsApp config yet. The first later inbound/outbound
+-- operation claims that legacy thread for a real channel. Stamp its historical
+-- messages at the database boundary and repair any pre-channel media proxy URLs
+-- at the same moment so no caller has to remember a second backfill step.
+CREATE OR REPLACE FUNCTION public.backfill_messages_after_conversation_channel_bind()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = public
+AS $$
+BEGIN
+  IF OLD.whatsapp_config_id IS NULL AND NEW.whatsapp_config_id IS NOT NULL THEN
+    UPDATE messages
+    SET
+      whatsapp_config_id = NEW.whatsapp_config_id,
+      media_url = CASE
+        WHEN media_url IS NOT NULL
+         AND media_url LIKE '%/api/whatsapp/media/%'
+         AND position('channel_id=' in media_url) = 0
+        THEN media_url
+          || CASE WHEN position('?' in media_url) > 0 THEN '&' ELSE '?' END
+          || 'channel_id=' || NEW.whatsapp_config_id::text
+        ELSE media_url
+      END
+    WHERE conversation_id = NEW.id
+      AND whatsapp_config_id IS NULL;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS backfill_messages_after_conversation_channel_bind ON conversations;
+CREATE TRIGGER backfill_messages_after_conversation_channel_bind
+  AFTER UPDATE OF whatsapp_config_id ON conversations
+  FOR EACH ROW EXECUTE FUNCTION public.backfill_messages_after_conversation_channel_bind();
+
 -- Harden migration 040's compatibility writer. A missing channel may be
 -- inferred from a template only when that name/language maps to exactly one
 -- local phone channel. If it exists on several channels/WABAs, choosing primary
