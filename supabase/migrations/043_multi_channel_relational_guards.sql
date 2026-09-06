@@ -7,9 +7,9 @@
 -- ============================================================
 
 -- A Flow run that points at a conversation must describe that exact
--- account/contact pair. This prevents a privileged/manual caller from pairing a
--- run for tenant A with tenant B's conversation, and makes conversation-scoped
--- multi-number flow state a database invariant rather than only runner logic.
+-- account/contact pair. contact_id is intentionally nullable for historical
+-- audit rows after a contact is deleted, so FK cleanup to NULL is allowed while
+-- the account/conversation relationship remains protected.
 CREATE OR REPLACE FUNCTION public.enforce_flow_run_conversation_identity()
 RETURNS TRIGGER
 LANGUAGE plpgsql
@@ -38,7 +38,10 @@ BEGIN
       USING ERRCODE = '23514';
   END IF;
 
-  IF NEW.contact_id IS DISTINCT FROM v_contact_id THEN
+  -- ON DELETE SET NULL preserves run history when the contact is removed.
+  -- While both references are live, however, they must identify the same CRM
+  -- contact as the conversation.
+  IF NEW.contact_id IS NOT NULL AND NEW.contact_id IS DISTINCT FROM v_contact_id THEN
     RAISE EXCEPTION 'Flow run contact does not match conversation contact'
       USING ERRCODE = '23514';
   END IF;
