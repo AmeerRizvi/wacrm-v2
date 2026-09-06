@@ -291,18 +291,43 @@ export async function POST(request: Request) {
       .limit(2)
 
     if (claimedError) {
-      console.error('[whatsapp/config POST] ownership lookup failed:', claimedError)
+      console.error('[whatsapp/config POST] phone ownership lookup failed:', claimedError)
       return NextResponse.json({ error: 'Failed to validate configuration' }, { status: 500 })
     }
-    const conflict = (claimedRows ?? []).find(
+    const phoneConflict = (claimedRows ?? []).find(
       (row: { id: string; account_id: string }) =>
         row.account_id !== accountId || row.id !== existing?.id,
     )
-    if (conflict) {
+    if (phoneConflict) {
       return NextResponse.json(
         { error: 'This WhatsApp phone number is already linked to another channel.' },
         { status: 409 },
       )
+    }
+
+    // A WABA owns one template catalog and must stay inside one CRM account.
+    // Perform this check with the service-role client BEFORE verify/register/
+    // subscribe calls so a cross-tenant attempt cannot cause Meta side effects
+    // and only then fail at the database trigger.
+    if (nextWabaId) {
+      const { data: wabaRows, error: wabaError } = await supabaseAdmin()
+        .from('whatsapp_config')
+        .select('id,account_id')
+        .eq('waba_id', nextWabaId)
+        .limit(2)
+      if (wabaError) {
+        console.error('[whatsapp/config POST] WABA ownership lookup failed:', wabaError)
+        return NextResponse.json({ error: 'Failed to validate WABA ownership' }, { status: 500 })
+      }
+      const wabaConflict = (wabaRows ?? []).find(
+        (row: { id: string; account_id: string }) => row.account_id !== accountId,
+      )
+      if (wabaConflict) {
+        return NextResponse.json(
+          { error: 'This WABA is already linked to another CRM workspace.' },
+          { status: 409 },
+        )
+      }
     }
 
     let plainAccessToken: string
