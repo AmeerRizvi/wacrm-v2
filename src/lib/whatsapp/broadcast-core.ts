@@ -12,8 +12,7 @@
 //                        row + the aggregate counts, finalize status.
 //
 // Recipient rows carry `whatsapp_message_id`, so the inbound webhook's
-// status handler (which matches on that column) updates delivered/read
-// for API broadcasts exactly as it does for dashboard ones.
+// status handler updates delivered/read on the same stored WhatsApp channel.
 // ============================================================
 
 import type { SupabaseClient } from '@supabase/supabase-js';
@@ -54,6 +53,8 @@ export interface CreateBroadcastParams {
   templateName: string;
   templateLanguage?: string | null;
   recipients: BroadcastRecipientInput[];
+  /** Explicit WhatsApp channel. Alias handling belongs to the HTTP route. */
+  channelId?: string | null;
 }
 
 interface PlannedRecipient {
@@ -64,6 +65,7 @@ interface PlannedRecipient {
 
 export interface BroadcastPlan {
   broadcastId: string;
+  whatsappConfigId: string;
   templateName: string;
   templateLanguage: string;
   phoneNumberId: string;
@@ -75,6 +77,88 @@ export interface BroadcastPlan {
 }
 
 const MAX_RECIPIENTS = 1000;
+
+type BroadcastChannel = {
+  id: string;
+  phone_number_id: string;
+  access_token: string;
+};
+
+async function resolveBroadcastChannel(
+  db: SupabaseClient,
+  accountId: string,
+  templateName: string,
+  templateLanguage: string,
+  requestedChannelId?: string | null,
+): Promise<BroadcastChannel> {
+  let channelId = requestedChannelId ?? null;
+
+  if (!channelId) {
+    // Legacy API callers did not send a channel. Preserve that convenience
+    // only when the local template catalog makes the answer unambiguous.
+    const { data: candidates, error: candidateError } = await db
+      .from('message_templates')
+      .select('whatsapp_config_id')
+      .eq('account_id', accountId)
+      .eq('name', templateName)
+      .eq('language', templateLanguage)
+      .not('whatsapp_config_id', 'is', null);
+    if (candidateError) {
+      throw new BroadcastError('internal', 'Failed to resolve broadcast channel', 500);
+    }
+
+    const unique = [
+      ...new Set(
+        (candidates ?? [])
+          .map((row: { whatsapp_config_id?: string | null }) => row.whatsapp_config_id)
+          .filter((id): id is string => Boolean(id)),
+      ),
+    ];
+    if (unique.length > 1) {
+      throw new BroadcastError(
+        'channel_required',
+        'This template is available on multiple WhatsApp channels. Supply channel_id.',
+        409,
+      );
+    }
+    if (unique.length === 1) channelId = unique[0];
+  }
+
+  if (!channelId) {
+    // A pre-sync legacy caller has no template row to infer from. Primary is
+    // the documented compatibility default; the template check below still
+    // requires the catalog to be synced before the broadcast is persisted.
+    const { data: primary, error: primaryError } = await db
+      .from('whatsapp_config')
+      .select('id')
+      .eq('account_id', accountId)
+      .eq('is_primary', true)
+      .maybeSingle();
+    if (primaryError) {
+      throw new BroadcastError('internal', 'Failed to resolve WhatsApp channel', 500);
+    }
+    channelId = primary?.id ?? null;
+  }
+
+  if (!channelId) {
+    throw new BroadcastError(
+      'whatsapp_not_configured',
+      'WhatsApp not configured. Please set up your WhatsApp integration first.',
+      400,
+    );
+  }
+
+  const { data: config, error: configError } = await db
+    .from('whatsapp_config')
+    .select('id,phone_number_id,access_token')
+    .eq('account_id', accountId)
+    .eq('id', channelId)
+    .maybeSingle();
+  if (configError || !config) {
+    throw new BroadcastError('channel_not_found', 'WhatsApp channel not found for this account.', 404);
+  }
+  return config as BroadcastChannel;
+}
 
 /**
  * Validate + persist a broadcast, resolving each recipient to a
@@ -108,35 +192,37 @@ export async function createBroadcast(
     );
   }
 
-  // Config (fail fast + provides the audit trail owner already resolved
-  // by the caller). Meta send needs phone_number_id + decrypted token.
-  const { data: config, error: configError } = await db
-    .from('whatsapp_config')
-    .select('*')
-    .eq('account_id', accountId)
-    .single();
-  if (configError || !config) {
-    throw new BroadcastError(
-      'whatsapp_not_configured',
-      'WhatsApp not configured. Please set up your WhatsApp integration first.',
-      400
-    );
-  }
+  const requestedLanguage = params.templateLanguage || 'en_US';
+  const config = await resolveBroadcastChannel(
+    db,
+    accountId,
+    templateName,
+    requestedLanguage,
+    params.channelId,
+  );
   const accessToken = decrypt(config.access_token);
 
-  // Template row (once) for header/button components; guard a
-  // malformed local row rather than N identical opaque failures.
+  // Template row (once) for header/button components. It must belong to the
+  // selected channel; same-named templates on another WABA are not substitutes.
   const resolvedTemplate = await resolveTemplateRow(
     db,
     accountId,
     templateName,
-    params.templateLanguage
+    params.templateLanguage,
+    config.id,
   );
   if (resolvedTemplate.malformed) {
     throw new BroadcastError(
       'template_malformed',
-      'Template row is malformed locally — run "Sync from Meta" in Settings to repair it before broadcasting.',
+      'Template row is malformed locally — sync this WhatsApp channel from Meta before broadcasting.',
       500
+    );
+  }
+  if (!resolvedTemplate.row) {
+    throw new BroadcastError(
+      'template_not_found',
+      'Template is not synced on the selected WhatsApp channel.',
+      400,
     );
   }
   const templateRow = resolvedTemplate.row;
@@ -163,11 +249,8 @@ export async function createBroadcast(
     });
   }
 
-  // Collapse recipients that resolved to the SAME contact (the caller
-  // listed a phone twice, or two numbers fuzzy-matched to one contact).
-  // Keep the first occurrence so the contact is messaged once and its
-  // params aren't silently overwritten by a later duplicate — and so
-  // the row↔params pairing below (keyed by contact_id) is unambiguous.
+  // Collapse recipients that resolved to the SAME contact. Keep the first
+  // occurrence so a contact is messaged once and params remain deterministic.
   const seenContact = new Set<string>();
   const deduped = resolved.filter((r) => {
     if (seenContact.has(r.contactId)) return false;
@@ -183,21 +266,9 @@ export async function createBroadcast(
     );
   }
 
-  // Persist the broadcast + its recipients. The count columns
-  // (sent/delivered/read/replied/failed) are owned by the DB aggregate
-  // trigger (migrations 003/005) and derived purely from
-  // broadcast_recipients rows — we deliberately do NOT seed them here
-  // (a manual value would be clobbered by the trigger on the first
-  // recipient change). `rejected` phones have no recipient row, so they
-  // are reported to the caller in the POST response, not in these
-  // persisted counts.
-  // Insert the parent broadcast and its recipient rows in ONE transaction
-  // (migration 037's create_broadcast_with_recipients). Previously these
-  // were two separate inserts: if the recipient insert failed, the parent
-  // was already persisted with status 'sending' and no recipients, leaving
-  // an orphaned campaign that looked like it was sending but had no
-  // delivery plan (issue #370). The function body is atomic, so a recipient
-  // failure now rolls the parent back and nothing orphaned survives.
+  // Migration 042 adds an explicit channel overload of the atomic creation RPC.
+  // Passing the channel into the SECURITY DEFINER function prevents privileged
+  // code from depending on trigger guessing.
   const { data: createdRows, error: createErr } = await db.rpc(
     'create_broadcast_with_recipients',
     {
@@ -208,9 +279,8 @@ export async function createBroadcast(
       p_template_language: resolvedTemplate.language,
       p_total_recipients: deduped.length,
       p_contact_ids: deduped.map((r) => r.contactId),
-      // Frozen per-recipient params (migration 038) — without them a
-      // resume of this broadcast has no way to reconstruct {{1}}.
       p_template_params: deduped.map((r) => r.params),
+      p_whatsapp_config_id: config.id,
     }
   );
   if (createErr || !createdRows || createdRows.length === 0) {
@@ -220,8 +290,6 @@ export async function createBroadcast(
 
   const broadcastId = createdRows[0].broadcast_id as string;
 
-  // Pair each inserted recipient row back to its phone/params by
-  // contact_id — unambiguous now that duplicates are collapsed.
   const byContact = new Map(deduped.map((r) => [r.contactId, r]));
   const planned: PlannedRecipient[] = createdRows.map(
     (row: { recipient_id: string; contact_id: string }) => {
@@ -232,6 +300,7 @@ export async function createBroadcast(
 
   return {
     broadcastId,
+    whatsappConfigId: config.id,
     templateName,
     templateLanguage: resolvedTemplate.language,
     phoneNumberId: config.phone_number_id,
@@ -247,13 +316,6 @@ export async function createBroadcast(
  * (phone-variant retry) and stamp its `broadcast_recipients` row.
  * Best-effort per recipient — one failure never aborts the rest.
  * Designed to run inside `after()`.
- *
- * The per-status count columns on `broadcasts` are owned by the DB
- * aggregate trigger (migrations 003/005): each recipient-row update
- * below advances them automatically, and later Meta delivery/read
- * webhooks keep advancing them. We therefore never write those columns
- * here — only the terminal `status` — otherwise a manual value would
- * race and clobber the trigger-maintained counts.
  */
 export async function deliverBroadcast(
   db: SupabaseClient,
@@ -281,7 +343,6 @@ export async function deliverBroadcast(
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Unknown error';
         lastError = message;
-        // Only a "recipient not allowed" error is worth another variant.
         if (!isRecipientNotAllowedError(message)) break;
       }
     }
@@ -295,7 +356,8 @@ export async function deliverBroadcast(
           whatsapp_message_id: sentMessageId,
           error_message: null,
         })
-        .eq('id', recipient.recipientRowId);
+        .eq('id', recipient.recipientRowId)
+        .eq('whatsapp_config_id', plan.whatsappConfigId);
     } else {
       await db
         .from('broadcast_recipients')
@@ -303,7 +365,8 @@ export async function deliverBroadcast(
           status: 'failed',
           error_message: lastError || 'Unknown error',
         })
-        .eq('id', recipient.recipientRowId);
+        .eq('id', recipient.recipientRowId)
+        .eq('whatsapp_config_id', plan.whatsappConfigId);
     }
   }
 
@@ -312,16 +375,7 @@ export async function deliverBroadcast(
 
 /**
  * Flip a broadcast out of `sending` once no recipient is left pending.
- *
- * Derived from the recipient rows rather than from a counter local to
- * one delivery pass: a resume (issue #472) delivers only the leftovers,
- * so "nothing sent *this* pass" must not mark a campaign failed when
- * 800 of its 1 000 recipients went out earlier. `failed` means every
- * single recipient failed; anything else that reached Meta is `sent`,
- * with the per-recipient failures visible in `failed_count`.
- *
- * Per-status counts stay trigger-owned (migrations 003/005) — only the
- * terminal `status` is written here.
+ * Counts are derived from recipient rows; only the terminal status is written.
  */
 export async function finalizeBroadcastStatus(
   db: SupabaseClient,
@@ -336,8 +390,6 @@ export async function finalizeBroadcastStatus(
     return count ?? 0;
   };
 
-  // Still work outstanding (a capped resume pass) — leave it 'sending'
-  // so the UI keeps offering Resume.
   if ((await countWhere('pending')) > 0) return;
 
   const failed = await countWhere('failed');
