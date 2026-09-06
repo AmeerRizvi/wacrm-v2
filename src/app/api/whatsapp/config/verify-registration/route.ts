@@ -7,15 +7,15 @@ import {
 } from '@/lib/whatsapp/meta-api'
 
 /**
- * GET /api/whatsapp/config/verify-registration
+ * GET /api/whatsapp/config/verify-registration?channel_id=<uuid>
  *
- * Diagnostic endpoint — confirms the user's saved phone number is
- * actually reachable on Meta's side. Solves the failure mode that
- * surfaced the multi-number bug originally: "UI says Connected but
- * Meta isn't delivering events."
+ * Diagnostic endpoint — confirms one saved WhatsApp channel is actually
+ * reachable on Meta's side. `whatsapp_config_id` is accepted as an alias.
+ * If neither is supplied, the account primary is used for backwards
+ * compatibility with pre-multi-channel callers.
  *
- * Three checks run independently so the UI can show which step
- * passes and which fails:
+ * Three checks run independently so the UI can show which step passes and
+ * which fails:
  *
  *   1. phone_info  — GET /{phone_number_id} succeeds
  *   2. waba_subscription — our app appears in
@@ -24,11 +24,11 @@ import {
  *                    /register last succeeded; NULL means the
  *                    number was saved but never actually subscribed
  *
- * Returns 200 in every case so the UI can render diagnostic detail
- * rather than a generic error toast. The combined `live` flag is
- * what the UI badges on.
+ * Returns 200 for diagnostic failures so the UI can render detail rather
+ * than a generic error toast. Authentication / invalid explicit channel
+ * selection still use normal HTTP error statuses.
  */
-export async function GET() {
+export async function GET(request: Request) {
   const supabase = await createClient()
   const {
     data: { user },
@@ -38,9 +38,6 @@ export async function GET() {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
-  // whatsapp_config is one-row-per-account post-017. Resolve the
-  // caller's account_id so a teammate who joined an existing account
-  // sees the same registration state as the admin who set it up.
   const { data: profile } = await supabase
     .from('profiles')
     .select('account_id')
@@ -55,17 +52,44 @@ export async function GET() {
     })
   }
 
-  const { data: config } = await supabase
+  const url = new URL(request.url)
+  const requestedChannelId =
+    url.searchParams.get('channel_id') ??
+    url.searchParams.get('whatsapp_config_id')
+
+  let configQuery = supabase
     .from('whatsapp_config')
     .select('*')
     .eq('account_id', accountId)
-    .maybeSingle()
+
+  if (requestedChannelId) {
+    configQuery = configQuery.eq('id', requestedChannelId)
+  } else {
+    configQuery = configQuery.eq('is_primary', true)
+  }
+
+  const { data: config, error: configError } = await configQuery.maybeSingle()
+
+  if (configError) {
+    console.error('Error resolving WhatsApp channel for diagnostics:', configError)
+    return NextResponse.json(
+      { error: 'Failed to resolve WhatsApp channel.' },
+      { status: 500 },
+    )
+  }
 
   if (!config) {
+    if (requestedChannelId) {
+      return NextResponse.json(
+        { error: 'WhatsApp channel not found.' },
+        { status: 404 },
+      )
+    }
+
     return NextResponse.json({
       live: false,
       checks: { config_exists: false },
-      message: 'No WhatsApp configuration saved yet.',
+      message: 'No primary WhatsApp channel is configured yet.',
     })
   }
 
@@ -74,6 +98,7 @@ export async function GET() {
     accessToken = decrypt(config.access_token)
   } catch {
     return NextResponse.json({
+      channel_id: config.id,
       live: false,
       checks: {
         config_exists: true,
@@ -119,10 +144,10 @@ export async function GET() {
         wabaId: config.waba_id,
         accessToken,
       })
-      // Meta returns the apps subscribed to this WABA. If the list
-      // is non-empty, OUR app is in there (the access_token we used
-      // belongs to our app — Meta wouldn't return data for an app
-      // the token can't see). Treat any entry as success.
+      // Meta returns the apps subscribed to this WABA. If the list is
+      // non-empty, OUR app is in there (the access_token we used belongs
+      // to our app — Meta wouldn't return data for an app the token can't
+      // see). Treat any entry as success.
       checks.waba_subscribed_to_app = subs.length > 0
       if (!checks.waba_subscribed_to_app) {
         errors.push(
@@ -146,6 +171,7 @@ export async function GET() {
     checks.locally_marked_registered
 
   return NextResponse.json({
+    channel_id: config.id,
     live,
     checks,
     errors,
