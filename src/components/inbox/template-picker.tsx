@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { useSearchParams } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
 import type { MessageTemplate } from "@/types";
 import { Button } from "@/components/ui/button";
@@ -50,11 +51,6 @@ interface UrlButtonSlot {
   url: string;
 }
 
-/**
- * Templates may need values for: body variables, a text-header
- * variable, and per-URL-button suffixes. Collect them all so the
- * send-message path doesn't 400 on missing parameters.
- */
 function collectVariableSlots(template: MessageTemplate): {
   bodyVars: number[];
   headerVarCount: number;
@@ -80,6 +76,8 @@ export function TemplatePicker({
   onSelect,
 }: TemplatePickerProps) {
   const t = useTranslations("Inbox.templatePicker");
+  const searchParams = useSearchParams();
+  const conversationId = searchParams.get("c");
 
   const [templates, setTemplates] = useState<MessageTemplate[]>([]);
   const [loading, setLoading] = useState(true);
@@ -99,7 +97,7 @@ export function TemplatePicker({
         data: { user },
       } = await supabase.auth.getUser();
 
-      if (!user) {
+      if (!user || !conversationId) {
         if (!cancelled) {
           setTemplates([]);
           setLoading(false);
@@ -107,14 +105,31 @@ export function TemplatePicker({
         return;
       }
 
-      // Scope by RLS (message_templates_select → is_account_member), NOT by
-      // user_id. Templates are account-owned, so filtering on the caller's
-      // user_id hid templates that a teammate created — leaving them unable
-      // to send approved templates in a shared account.
+      // A template must come from the same WhatsApp channel as the active
+      // conversation. Names can overlap across WABAs, and showing another
+      // channel's copy here gives the agent a preview that the backend cannot
+      // safely send from this thread.
+      const { data: conversation, error: conversationError } = await supabase
+        .from("conversations")
+        .select("whatsapp_config_id")
+        .eq("id", conversationId)
+        .maybeSingle();
+
+      if (cancelled) return;
+      if (conversationError || !conversation?.whatsapp_config_id) {
+        if (conversationError) {
+          console.error("Failed to resolve conversation channel:", conversationError);
+        }
+        setTemplates([]);
+        setLoading(false);
+        return;
+      }
+
       const { data, error } = await supabase
         .from("message_templates")
         .select("*")
         .eq("status", "APPROVED")
+        .eq("whatsapp_config_id", conversation.whatsapp_config_id)
         .order("created_at", { ascending: false });
 
       if (cancelled) return;
@@ -130,7 +145,7 @@ export function TemplatePicker({
     return () => {
       cancelled = true;
     };
-  }, [open]);
+  }, [open, conversationId]);
 
   function resetSelection() {
     setSelected(null);
@@ -196,9 +211,7 @@ export function TemplatePicker({
             {selected ? selected.name : t("sendTemplate")}
           </DialogTitle>
           <DialogDescription className="text-muted-foreground">
-            {selected
-              ? t("fillPlaceholders")
-              : t("pickTemplate")}
+            {selected ? t("fillPlaceholders") : t("pickTemplate")}
           </DialogDescription>
         </DialogHeader>
 
@@ -212,34 +225,34 @@ export function TemplatePicker({
               <div className="rounded-md border border-border bg-background/50 p-6 text-center">
                 <p className="text-sm text-popover-foreground">{t("noApprovedTemplates")}</p>
                 <p className="mt-1 text-xs text-muted-foreground">
-                  {t("noApprovedTemplatesHint")}
+                  No approved templates are synced for this conversation&apos;s WhatsApp number.
                 </p>
               </div>
             ) : (
-              templates.map((t) => (
+              templates.map((template) => (
                 <button
-                  key={t.id}
+                  key={template.id}
                   type="button"
-                  onClick={() => pickTemplate(t)}
+                  onClick={() => pickTemplate(template)}
                   className="w-full rounded-md border border-border bg-background/50 p-3 text-left transition-colors hover:border-primary/40 hover:bg-popover"
                 >
                   <div className="flex items-start gap-2">
                     <div className="min-w-0 flex-1">
                       <div className="flex flex-wrap items-center gap-2">
                         <p className="truncate text-sm font-medium text-popover-foreground">
-                          {t.name}
+                          {template.name}
                         </p>
                         <Badge className="border border-primary/30 bg-primary/20 text-[10px] text-primary">
-                          {t.category}
+                          {template.category}
                         </Badge>
-                        {t.language && (
+                        {template.language && (
                           <span className="text-[10px] uppercase text-muted-foreground">
-                            {t.language}
+                            {template.language}
                           </span>
                         )}
                       </div>
                       <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">
-                        {t.body_text}
+                        {template.body_text}
                       </p>
                     </div>
                     <ChevronRight className="h-4 w-4 flex-shrink-0 text-muted-foreground" />
@@ -263,9 +276,7 @@ export function TemplatePicker({
             </div>
             {slots && slots.headerVarCount > 0 && (
               <div className="space-y-1">
-                <Label className="text-xs text-popover-foreground">
-                  {`Header {{1}}`}
-                </Label>
+                <Label className="text-xs text-popover-foreground">{`Header {{1}}`}</Label>
                 <Input
                   value={headerText}
                   onChange={(e) => setHeaderText(e.target.value)}
@@ -305,8 +316,10 @@ export function TemplatePicker({
                   placeholder={t("urlSuffixValuePlaceholder")}
                   className="border-border bg-muted text-foreground placeholder:text-muted-foreground"
                 />
-                <p className="text-[10px] text-muted-foreground break-all">
-                  {t("finalUrl", { url: slot.url.replace(/\{\{1\}\}/g, buttonParams[slot.index] || "{{1}}") })}
+                <p className="break-all text-[10px] text-muted-foreground">
+                  {t("finalUrl", {
+                    url: slot.url.replace(/\{\{1\}\}/g, buttonParams[slot.index] || "{{1}}"),
+                  })}
                 </p>
               </div>
             ))}
