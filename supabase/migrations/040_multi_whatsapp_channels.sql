@@ -19,9 +19,92 @@ UPDATE whatsapp_config wc SET is_primary = (ranked.rn = 1) FROM ranked WHERE wc.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_whatsapp_config_one_primary_per_account ON whatsapp_config(account_id) WHERE is_primary = TRUE;
 CREATE INDEX IF NOT EXISTS idx_whatsapp_config_account_created ON whatsapp_config(account_id, created_at);
 
--- Channel history is deliberately RESTRICTed on delete. A used WhatsApp
--- number must never disappear from an old conversation/message and cause a
--- later send or status lookup to silently fall back to another number.
+-- A channel row is the permanent identity of one Meta phone number. Credentials,
+-- labels and operational state may rotate, but changing phone_number_id in-place
+-- would make historical conversations appear to have belonged to a different
+-- number. Connecting a different number therefore means creating a new channel.
+CREATE OR REPLACE FUNCTION public.prevent_whatsapp_channel_identity_change()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = public
+AS $$
+BEGIN
+  IF NEW.phone_number_id IS DISTINCT FROM OLD.phone_number_id THEN
+    RAISE EXCEPTION 'phone_number_id is immutable for an existing WhatsApp channel; create a new channel instead'
+      USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS prevent_whatsapp_channel_identity_change ON whatsapp_config;
+CREATE TRIGGER prevent_whatsapp_channel_identity_change
+  BEFORE UPDATE OF phone_number_id ON whatsapp_config
+  FOR EACH ROW EXECUTE FUNCTION public.prevent_whatsapp_channel_identity_change();
+
+-- Keep primary selection transactional. Application-side "demote then promote"
+-- is racy: a failed second request can leave an account with no primary. The
+-- advisory lock serializes primary changes per account, the partial unique index
+-- remains a final safety net, and deleting a primary promotes the oldest survivor.
+CREATE OR REPLACE FUNCTION public.maintain_whatsapp_primary_channel()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = public
+AS $$
+BEGIN
+  PERFORM pg_advisory_xact_lock(hashtextextended(NEW.account_id::text, 0));
+
+  IF TG_OP = 'INSERT' AND NOT NEW.is_primary AND NOT EXISTS (
+    SELECT 1 FROM whatsapp_config wc WHERE wc.account_id = NEW.account_id AND wc.is_primary
+  ) THEN
+    NEW.is_primary := TRUE;
+  END IF;
+
+  IF NEW.is_primary THEN
+    UPDATE whatsapp_config
+    SET is_primary = FALSE, updated_at = now()
+    WHERE account_id = NEW.account_id
+      AND id IS DISTINCT FROM NEW.id
+      AND is_primary = TRUE;
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS maintain_whatsapp_primary_channel ON whatsapp_config;
+CREATE TRIGGER maintain_whatsapp_primary_channel
+  BEFORE INSERT OR UPDATE OF is_primary ON whatsapp_config
+  FOR EACH ROW EXECUTE FUNCTION public.maintain_whatsapp_primary_channel();
+
+CREATE OR REPLACE FUNCTION public.promote_whatsapp_primary_after_delete()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = public
+AS $$
+DECLARE
+  replacement_id UUID;
+BEGIN
+  IF NOT OLD.is_primary THEN
+    RETURN OLD;
+  END IF;
+
+  PERFORM pg_advisory_xact_lock(hashtextextended(OLD.account_id::text, 0));
+  SELECT id INTO replacement_id
+  FROM whatsapp_config
+  WHERE account_id = OLD.account_id
+  ORDER BY created_at ASC, id ASC
+  LIMIT 1;
+
+  IF replacement_id IS NOT NULL THEN
+    UPDATE whatsapp_config SET is_primary = TRUE WHERE id = replacement_id;
+  END IF;
+  RETURN OLD;
+END;
+$$;
+DROP TRIGGER IF EXISTS promote_whatsapp_primary_after_delete ON whatsapp_config;
+CREATE TRIGGER promote_whatsapp_primary_after_delete
+  AFTER DELETE ON whatsapp_config
+  FOR EACH ROW EXECUTE FUNCTION public.promote_whatsapp_primary_after_delete();
+
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS whatsapp_config_id UUID REFERENCES whatsapp_config(id) ON DELETE RESTRICT;
 UPDATE conversations c SET whatsapp_config_id = wc.id FROM whatsapp_config wc WHERE c.account_id = wc.account_id AND wc.is_primary = TRUE AND c.whatsapp_config_id IS NULL;
 CREATE INDEX IF NOT EXISTS idx_conversations_whatsapp_config ON conversations(whatsapp_config_id);
@@ -33,6 +116,18 @@ ALTER TABLE messages ADD COLUMN IF NOT EXISTS whatsapp_config_id UUID REFERENCES
 UPDATE messages m SET whatsapp_config_id = c.whatsapp_config_id FROM conversations c WHERE m.conversation_id = c.id AND m.whatsapp_config_id IS NULL;
 CREATE INDEX IF NOT EXISTS idx_messages_whatsapp_config ON messages(whatsapp_config_id);
 CREATE INDEX IF NOT EXISTS idx_messages_wamid_channel ON messages(message_id, whatsapp_config_id) WHERE message_id IS NOT NULL;
+
+-- Old Meta-media fallback URLs pre-date channel query parameters. Bind them to
+-- the backfilled channel now so changing the account primary later cannot make
+-- an old attachment try to decrypt/fetch with another phone's credentials.
+UPDATE messages
+SET media_url = media_url
+  || CASE WHEN position('?' in media_url) > 0 THEN '&' ELSE '?' END
+  || 'channel_id=' || whatsapp_config_id::text
+WHERE whatsapp_config_id IS NOT NULL
+  AND media_url IS NOT NULL
+  AND media_url LIKE '%/api/whatsapp/media/%'
+  AND position('channel_id=' in media_url) = 0;
 
 ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS whatsapp_config_id UUID REFERENCES whatsapp_config(id) ON DELETE RESTRICT;
 UPDATE broadcasts b SET whatsapp_config_id = wc.id FROM whatsapp_config wc WHERE b.account_id = wc.account_id AND wc.is_primary = TRUE AND b.whatsapp_config_id IS NULL;
@@ -53,8 +148,73 @@ DROP INDEX IF EXISTS idx_one_active_run_per_contact;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_run_per_conversation ON flow_runs(account_id, conversation_id) WHERE status = 'active' AND conversation_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_run_legacy_contact ON flow_runs(account_id, contact_id) WHERE status = 'active' AND conversation_id IS NULL;
 
--- Backward-compatible broadcast writers resolve the channel from the chosen
--- template first, then fall back to the account primary channel.
+-- Service-role webhook/worker code bypasses RLS, so database invariants must
+-- still prevent account A rows from pointing at account B's WhatsApp channel.
+CREATE OR REPLACE FUNCTION public.enforce_whatsapp_channel_account()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = public
+AS $$
+DECLARE
+  channel_account UUID;
+BEGIN
+  IF NEW.whatsapp_config_id IS NULL THEN
+    RETURN NEW;
+  END IF;
+
+  SELECT account_id INTO channel_account FROM whatsapp_config WHERE id = NEW.whatsapp_config_id;
+  IF channel_account IS NULL OR channel_account IS DISTINCT FROM NEW.account_id THEN
+    RAISE EXCEPTION 'WhatsApp channel does not belong to row account'
+      USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS enforce_conversation_whatsapp_channel_account ON conversations;
+CREATE TRIGGER enforce_conversation_whatsapp_channel_account
+  BEFORE INSERT OR UPDATE OF account_id, whatsapp_config_id ON conversations
+  FOR EACH ROW EXECUTE FUNCTION public.enforce_whatsapp_channel_account();
+
+DROP TRIGGER IF EXISTS enforce_broadcast_whatsapp_channel_account ON broadcasts;
+CREATE TRIGGER enforce_broadcast_whatsapp_channel_account
+  BEFORE INSERT OR UPDATE OF account_id, whatsapp_config_id ON broadcasts
+  FOR EACH ROW EXECUTE FUNCTION public.enforce_whatsapp_channel_account();
+
+DROP TRIGGER IF EXISTS enforce_template_whatsapp_channel_account ON message_templates;
+CREATE TRIGGER enforce_template_whatsapp_channel_account
+  BEFORE INSERT OR UPDATE OF account_id, whatsapp_config_id ON message_templates
+  FOR EACH ROW EXECUTE FUNCTION public.enforce_whatsapp_channel_account();
+
+-- Messages inherit their conversation channel and may never disagree with it.
+CREATE OR REPLACE FUNCTION public.inherit_message_whatsapp_channel()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = public
+AS $$
+DECLARE
+  expected_channel UUID;
+BEGIN
+  SELECT whatsapp_config_id INTO expected_channel
+  FROM conversations WHERE id = NEW.conversation_id;
+
+  IF NEW.whatsapp_config_id IS NULL THEN
+    NEW.whatsapp_config_id := expected_channel;
+  ELSIF NEW.whatsapp_config_id IS DISTINCT FROM expected_channel THEN
+    RAISE EXCEPTION 'Message WhatsApp channel does not match conversation channel'
+      USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS inherit_message_whatsapp_channel ON messages;
+CREATE TRIGGER inherit_message_whatsapp_channel
+  BEFORE INSERT OR UPDATE OF conversation_id, whatsapp_config_id ON messages
+  FOR EACH ROW EXECUTE FUNCTION public.inherit_message_whatsapp_channel();
+
+-- Backward-compatible broadcast writers (the existing browser wizard and any
+-- older API client) do not know about whatsapp_config_id. Resolve the channel
+-- from the selected template when unambiguous, then prefer the primary channel.
 CREATE OR REPLACE FUNCTION public.inherit_broadcast_whatsapp_channel()
 RETURNS TRIGGER
 LANGUAGE plpgsql
@@ -94,10 +254,17 @@ RETURNS TRIGGER
 LANGUAGE plpgsql
 SET search_path = public
 AS $$
+DECLARE
+  expected_channel UUID;
 BEGIN
+  SELECT whatsapp_config_id INTO expected_channel
+  FROM broadcasts WHERE id = NEW.broadcast_id;
+
   IF NEW.whatsapp_config_id IS NULL THEN
-    SELECT b.whatsapp_config_id INTO NEW.whatsapp_config_id
-    FROM broadcasts b WHERE b.id = NEW.broadcast_id;
+    NEW.whatsapp_config_id := expected_channel;
+  ELSIF NEW.whatsapp_config_id IS DISTINCT FROM expected_channel THEN
+    RAISE EXCEPTION 'Broadcast recipient WhatsApp channel does not match broadcast channel'
+      USING ERRCODE = '23514';
   END IF;
   RETURN NEW;
 END;
