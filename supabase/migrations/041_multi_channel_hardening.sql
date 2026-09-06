@@ -5,6 +5,49 @@
 -- These rules protect service-role/background writers as well as the UI.
 -- ============================================================
 
+-- A Meta WABA owns one shared template catalog. Splitting phone numbers from
+-- the same WABA across two CRM accounts would make template lifecycle events,
+-- edits and deletes cross tenant boundaries by definition. One WABA may have
+-- many channels, but every one of those channels must belong to one account.
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM whatsapp_config
+    WHERE waba_id IS NOT NULL
+    GROUP BY waba_id
+    HAVING count(DISTINCT account_id) > 1
+  ) THEN
+    RAISE EXCEPTION 'A WhatsApp Business Account (WABA) is linked to multiple CRM accounts; resolve the tenant ownership conflict before enabling multi-channel support';
+  END IF;
+END
+$$;
+
+CREATE OR REPLACE FUNCTION public.enforce_waba_single_account()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = public
+AS $$
+BEGIN
+  IF NEW.waba_id IS NOT NULL AND EXISTS (
+    SELECT 1
+    FROM whatsapp_config wc
+    WHERE wc.waba_id = NEW.waba_id
+      AND wc.account_id IS DISTINCT FROM NEW.account_id
+      AND wc.id IS DISTINCT FROM NEW.id
+  ) THEN
+    RAISE EXCEPTION 'This WABA is already linked to another CRM account'
+      USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS enforce_waba_single_account ON whatsapp_config;
+CREATE TRIGGER enforce_waba_single_account
+  BEFORE INSERT OR UPDATE OF waba_id, account_id ON whatsapp_config
+  FOR EACH ROW EXECUTE FUNCTION public.enforce_waba_single_account();
+
 -- Once a channel has local template history its WABA becomes part of that
 -- history's identity. Moving the same channel row to another WABA would leave
 -- Meta template ids pointing at the wrong catalog. WABA corrections are still
