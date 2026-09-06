@@ -39,9 +39,13 @@ export type VariableMapping =
   | { type: 'field'; value: string }
   | { type: 'custom_field'; value: string };
 
+type BroadcastTemplate = MessageTemplate & {
+  whatsapp_config_id?: string | null;
+};
+
 interface BroadcastPayload {
   name: string;
-  template: MessageTemplate;
+  template: BroadcastTemplate;
   audience: AudienceConfig;
   variables: Record<string, VariableMapping>;
   /**
@@ -367,6 +371,13 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
         throw new Error('Your profile is not linked to an account.');
       }
 
+      const channelId = payload.template.whatsapp_config_id;
+      if (!channelId) {
+        throw new Error(
+          'The selected template is not linked to a WhatsApp channel. Sync templates for the intended number and select it again.',
+        );
+      }
+
       // ── Step 1: Resolve audience contacts ─────────────────────────
       setProgress(5);
       const contacts = await resolveAudience(payload.audience);
@@ -382,6 +393,7 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
         .insert({
           user_id: user.id,
           account_id: accountId,
+          whatsapp_config_id: channelId,
           name: payload.name,
           template_name: payload.template.name,
           template_language: payload.template.language ?? 'en_US',
@@ -435,6 +447,7 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
       const recipientRows = contacts.map((contact) => ({
         broadcast_id: broadcast.id,
         contact_id: contact.id,
+        whatsapp_config_id: channelId,
         status: 'pending' as const,
         template_params: paramsByContact.get(contact.id) ?? [],
       }));
@@ -518,6 +531,7 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
                 recipients: apiRecipients,
                 template_name: payload.template.name,
                 template_language: payload.template.language ?? 'en_US',
+                channel_id: channelId,
               }),
             });
 
