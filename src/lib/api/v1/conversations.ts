@@ -1,17 +1,19 @@
 // ============================================================
 // Public API (v1) serializers for conversations + messages.
 //
-// The dashboard's `Conversation`/`Message` rows carry internal columns
-// (account_id, user_id, sender_id) that shouldn't leak onto the public
-// wire. These serializers project the stable public subset and rename
-// the Meta id (`message_id` → `whatsapp_message_id`) to match the send
-// endpoint's response vocabulary.
+// Multi-channel callers need the stable WhatsApp channel id on reads so they
+// can correlate a Sales/Support thread and reuse that id on future sends.
+// Internal tenant/audit columns remain hidden.
 // ============================================================
 
 import type { Conversation, Message } from '@/types';
 
+type ChannelConversation = Conversation & { whatsapp_config_id?: string | null };
+type ChannelMessage = Message & { whatsapp_config_id?: string | null };
+
 export interface ApiConversation {
   id: string;
+  channel_id: string | null;
   contact_id: string;
   status: string;
   assigned_agent_id: string | null;
@@ -32,6 +34,7 @@ export interface ApiConversation {
 
 export interface ApiMessage {
   id: string;
+  channel_id: string | null;
   conversation_id: string;
   direction: 'inbound' | 'outbound';
   sender_type: string;
@@ -46,14 +49,12 @@ export interface ApiMessage {
   created_at: string;
 }
 
-/**
- * Project a normalized `Conversation` (from `normalizeConversation`,
- * which has already flattened `contact.tags`) into the public shape.
- */
 export function serializeConversation(conv: Conversation): ApiConversation {
+  const row = conv as ChannelConversation;
   const c = conv.contact;
   return {
     id: conv.id,
+    channel_id: row.whatsapp_config_id ?? null,
     contact_id: conv.contact_id,
     status: conv.status,
     assigned_agent_id: conv.assigned_agent_id ?? null,
@@ -79,12 +80,12 @@ export function serializeConversation(conv: Conversation): ApiConversation {
   };
 }
 
-/** Project a `messages` row into the public shape. */
 export function serializeMessage(m: Message): ApiMessage {
+  const row = m as ChannelMessage;
   return {
     id: m.id,
+    channel_id: row.whatsapp_config_id ?? null,
     conversation_id: m.conversation_id,
-    // `customer` = inbound (from the contact); anything else is outbound.
     direction: m.sender_type === 'customer' ? 'inbound' : 'outbound',
     sender_type: m.sender_type,
     content_type: m.content_type,
