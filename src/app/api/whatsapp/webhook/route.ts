@@ -185,6 +185,7 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
         await handleTemplateWebhookChange(
           { field: change.field, value: change.value as unknown },
           supabaseAdmin(),
+          entry.id,
         )
         continue
       }
