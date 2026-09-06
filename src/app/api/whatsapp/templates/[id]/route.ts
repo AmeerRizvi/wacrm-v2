@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server'
+import type { SupabaseClient } from '@supabase/supabase-js'
 import { requireRole, toErrorResponse } from '@/lib/auth/account'
 import { decrypt } from '@/lib/whatsapp/encryption'
 import { deleteMessageTemplate, editMessageTemplate } from '@/lib/whatsapp/meta-api'
@@ -10,7 +11,7 @@ const EDITABLE_STATUSES = new Set(['APPROVED', 'REJECTED', 'PAUSED'])
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 function isDryRun() { return process.env.WHATSAPP_TEMPLATES_DRY_RUN === 'true' || process.env.WHATSAPP_TEMPLATES_DRY_RUN === '1' }
 
-async function loadTemplateAndChannel(supabase: any, accountId: string, id: string) {
+async function loadTemplateAndChannel(supabase: SupabaseClient, accountId: string, id: string) {
   const { data: template, error } = await supabase
     .from('message_templates')
     .select('id,name,status,meta_template_id,language,whatsapp_config_id')
