@@ -19,27 +19,30 @@ UPDATE whatsapp_config wc SET is_primary = (ranked.rn = 1) FROM ranked WHERE wc.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_whatsapp_config_one_primary_per_account ON whatsapp_config(account_id) WHERE is_primary = TRUE;
 CREATE INDEX IF NOT EXISTS idx_whatsapp_config_account_created ON whatsapp_config(account_id, created_at);
 
-ALTER TABLE conversations ADD COLUMN IF NOT EXISTS whatsapp_config_id UUID REFERENCES whatsapp_config(id) ON DELETE SET NULL;
+-- Channel history is deliberately RESTRICTed on delete. A used WhatsApp
+-- number must never disappear from an old conversation/message and cause a
+-- later send or status lookup to silently fall back to another number.
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS whatsapp_config_id UUID REFERENCES whatsapp_config(id) ON DELETE RESTRICT;
 UPDATE conversations c SET whatsapp_config_id = wc.id FROM whatsapp_config wc WHERE c.account_id = wc.account_id AND wc.is_primary = TRUE AND c.whatsapp_config_id IS NULL;
 CREATE INDEX IF NOT EXISTS idx_conversations_whatsapp_config ON conversations(whatsapp_config_id);
 DROP INDEX IF EXISTS idx_conversations_account_contact;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_account_contact_channel ON conversations(account_id, contact_id, whatsapp_config_id) WHERE whatsapp_config_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_account_contact_no_channel ON conversations(account_id, contact_id) WHERE whatsapp_config_id IS NULL;
 
-ALTER TABLE messages ADD COLUMN IF NOT EXISTS whatsapp_config_id UUID REFERENCES whatsapp_config(id) ON DELETE SET NULL;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS whatsapp_config_id UUID REFERENCES whatsapp_config(id) ON DELETE RESTRICT;
 UPDATE messages m SET whatsapp_config_id = c.whatsapp_config_id FROM conversations c WHERE m.conversation_id = c.id AND m.whatsapp_config_id IS NULL;
 CREATE INDEX IF NOT EXISTS idx_messages_whatsapp_config ON messages(whatsapp_config_id);
 CREATE INDEX IF NOT EXISTS idx_messages_wamid_channel ON messages(message_id, whatsapp_config_id) WHERE message_id IS NOT NULL;
 
-ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS whatsapp_config_id UUID REFERENCES whatsapp_config(id) ON DELETE SET NULL;
+ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS whatsapp_config_id UUID REFERENCES whatsapp_config(id) ON DELETE RESTRICT;
 UPDATE broadcasts b SET whatsapp_config_id = wc.id FROM whatsapp_config wc WHERE b.account_id = wc.account_id AND wc.is_primary = TRUE AND b.whatsapp_config_id IS NULL;
 CREATE INDEX IF NOT EXISTS idx_broadcasts_whatsapp_config ON broadcasts(whatsapp_config_id);
 
-ALTER TABLE broadcast_recipients ADD COLUMN IF NOT EXISTS whatsapp_config_id UUID REFERENCES whatsapp_config(id) ON DELETE SET NULL;
+ALTER TABLE broadcast_recipients ADD COLUMN IF NOT EXISTS whatsapp_config_id UUID REFERENCES whatsapp_config(id) ON DELETE RESTRICT;
 UPDATE broadcast_recipients br SET whatsapp_config_id = b.whatsapp_config_id FROM broadcasts b WHERE br.broadcast_id = b.id AND br.whatsapp_config_id IS NULL;
 CREATE INDEX IF NOT EXISTS idx_broadcast_recipients_wamid_channel ON broadcast_recipients(whatsapp_message_id, whatsapp_config_id) WHERE whatsapp_message_id IS NOT NULL;
 
-ALTER TABLE message_templates ADD COLUMN IF NOT EXISTS whatsapp_config_id UUID REFERENCES whatsapp_config(id) ON DELETE SET NULL;
+ALTER TABLE message_templates ADD COLUMN IF NOT EXISTS whatsapp_config_id UUID REFERENCES whatsapp_config(id) ON DELETE RESTRICT;
 UPDATE message_templates mt SET whatsapp_config_id = wc.id FROM whatsapp_config wc WHERE mt.account_id = wc.account_id AND wc.is_primary = TRUE AND mt.whatsapp_config_id IS NULL;
 CREATE INDEX IF NOT EXISTS idx_message_templates_whatsapp_config ON message_templates(whatsapp_config_id);
 ALTER TABLE message_templates DROP CONSTRAINT IF EXISTS message_templates_user_name_language_key;
@@ -50,9 +53,8 @@ DROP INDEX IF EXISTS idx_one_active_run_per_contact;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_run_per_conversation ON flow_runs(account_id, conversation_id) WHERE status = 'active' AND conversation_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_run_legacy_contact ON flow_runs(account_id, contact_id) WHERE status = 'active' AND conversation_id IS NULL;
 
--- Backward-compatible broadcast writers (the existing browser wizard and any
--- older API client) do not know about whatsapp_config_id. Resolve the channel
--- from the selected template when unambiguous, then prefer the primary channel.
+-- Backward-compatible broadcast writers resolve the channel from the chosen
+-- template first, then fall back to the account primary channel.
 CREATE OR REPLACE FUNCTION public.inherit_broadcast_whatsapp_channel()
 RETURNS TRIGGER
 LANGUAGE plpgsql
