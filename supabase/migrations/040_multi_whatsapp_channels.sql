@@ -75,6 +75,25 @@ CREATE TRIGGER maintain_whatsapp_primary_channel
   BEFORE INSERT OR UPDATE OF is_primary ON whatsapp_config
   FOR EACH ROW EXECUTE FUNCTION public.maintain_whatsapp_primary_channel();
 
+-- Deletes must acquire the SAME account lock before touching the row. Taking
+-- this lock only in an AFTER DELETE trigger creates a lock-order inversion with
+-- a concurrent "make primary" transaction (advisory lock -> row lock), which
+-- can deadlock against DELETE's row lock -> advisory lock ordering.
+CREATE OR REPLACE FUNCTION public.lock_whatsapp_channel_before_delete()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = public
+AS $$
+BEGIN
+  PERFORM pg_advisory_xact_lock(hashtextextended(OLD.account_id::text, 0));
+  RETURN OLD;
+END;
+$$;
+DROP TRIGGER IF EXISTS lock_whatsapp_channel_before_delete ON whatsapp_config;
+CREATE TRIGGER lock_whatsapp_channel_before_delete
+  BEFORE DELETE ON whatsapp_config
+  FOR EACH ROW EXECUTE FUNCTION public.lock_whatsapp_channel_before_delete();
+
 CREATE OR REPLACE FUNCTION public.promote_whatsapp_primary_after_delete()
 RETURNS TRIGGER
 LANGUAGE plpgsql
@@ -87,7 +106,8 @@ BEGIN
     RETURN OLD;
   END IF;
 
-  PERFORM pg_advisory_xact_lock(hashtextextended(OLD.account_id::text, 0));
+  -- The BEFORE DELETE trigger above already holds the account-scoped advisory
+  -- lock for this transaction, so promotion cannot race another primary change.
   SELECT id INTO replacement_id
   FROM whatsapp_config
   WHERE account_id = OLD.account_id
