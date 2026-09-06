@@ -12,9 +12,11 @@ import { resolveFallbackPolicy } from '@/lib/flows/fallback'
  * row for the audit trail.
  *
  * Without this sweep, a customer who abandons a flow mid-conversation
- * keeps a row in `idx_one_active_run_per_contact` (the partial unique
- * index on `flow_runs WHERE status='active'`) forever — blocking any
- * new triggers for them. The cron is therefore not optional.
+ * keeps a row in `idx_one_active_run_per_conversation` (the partial unique
+ * index on `flow_runs WHERE status='active'`) forever — blocking a new
+ * Flow trigger on that exact WhatsApp conversation. A different channel
+ * conversation for the same contact is intentionally independent.
+ * The cron is therefore not optional.
  *
  * Auth: re-uses `AUTOMATION_CRON_SECRET` so operators only have one
  * secret to provision. The two endpoints (`/api/automations/cron`
