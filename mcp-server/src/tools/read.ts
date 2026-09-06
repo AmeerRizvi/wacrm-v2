@@ -68,10 +68,15 @@ export function registerReadTools(server: McpServer, client: WacrmClient): void 
     {
       title: 'List conversations',
       description:
-        'List conversations, newest first. Optionally filter by status (open / pending / closed) or by contact id. Paginated.',
+        'List conversations, newest first. Optionally filter by status (open / pending / closed), contact id, or WhatsApp channel id. Paginated. Returned conversations include channel_id.',
       inputSchema: {
         status: z.enum(['open', 'pending', 'closed']).optional().describe('Conversation status filter.'),
         contact_id: z.string().optional().describe('Only conversations for this contact.'),
+        channel_id: z
+          .string()
+          .uuid()
+          .optional()
+          .describe('Only conversations owned by this WhatsApp channel UUID.'),
         limit: z.number().int().min(1).max(100).optional().describe('Page size, 1–100 (default 50).'),
         cursor: z.string().optional().describe('Opaque pagination cursor.'),
       },
@@ -84,7 +89,7 @@ export function registerReadTools(server: McpServer, client: WacrmClient): void 
     'get_conversation',
     {
       title: 'Get conversation',
-      description: 'Read a single conversation by id, including its contact and tags.',
+      description: 'Read a single conversation by id, including its contact, tags, and channel_id.',
       inputSchema: {
         id: z.string().describe('Conversation id.'),
       },
@@ -98,7 +103,7 @@ export function registerReadTools(server: McpServer, client: WacrmClient): void 
     {
       title: 'List messages',
       description:
-        'List the messages in a conversation, newest first. Each message includes its direction (inbound/outbound), delivery status, and content. Paginated.',
+        'List the messages in a conversation, newest first. Each message includes its channel_id, direction (inbound/outbound), delivery status, and content. Paginated.',
       inputSchema: {
         conversation_id: z.string().describe('The conversation to read messages from.'),
         limit: z.number().int().min(1).max(100).optional().describe('Page size, 1–100 (default 50).'),
@@ -116,7 +121,7 @@ export function registerReadTools(server: McpServer, client: WacrmClient): void 
     {
       title: 'Get broadcast status',
       description:
-        'Read a broadcast campaign by id — its status and delivered / read / rejected counts. Use this to poll progress after launching one.',
+        'Read a broadcast campaign by id — including its channel_id, status and delivered / read / rejected counts. Use this to poll progress after launching one.',
       inputSchema: {
         id: z.string().describe('Broadcast id.'),
       },
