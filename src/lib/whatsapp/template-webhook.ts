@@ -8,23 +8,10 @@
  *   - message_template_quality_update     — GREEN / YELLOW / RED quality score
  *   - message_template_components_update  — Meta auto-modified the template
  *
- * The route handler at /api/whatsapp/webhook receives every change and
- * delegates here when `change.field` starts with `message_template_`.
- *
- * ─── Setup requirement (out-of-band) ──────────────────────────────
- * These fields are NOT subscribed to by default. In Meta App Dashboard
- * → WhatsApp → Configuration → Webhooks, you must explicitly toggle
- * each of the three fields above. There is no API to do this for
- * Cloud API apps — it's a one-time manual step per app. Until that's
- * done, status updates only land via the manual "Sync from Meta"
- * button (the legacy fallback, intentionally preserved).
- *
- * ─── Multi-tenant note ────────────────────────────────────────────
- * `meta_template_id` is globally unique per WABA — the lookup doesn't
- * filter by user_id. If two wacrm tenants somehow ended up with the
- * same id (impossible in practice, but a theoretical race during
- * cross-tenant moves), the handler updates both rows and logs a
- * warning so operators can investigate.
+ * Template lifecycle events are WABA-scoped. Meta's webhook entry id is the
+ * WhatsApp Business Account id, while `message_template_id` is only guaranteed
+ * unique inside that WABA. The caller therefore passes entry.id so updates are
+ * fanned out only to local channel copies belonging to that WABA.
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js'
@@ -67,36 +54,49 @@ export interface TemplateWebhookChange {
   value: unknown
 }
 
+async function channelIdsForWaba(
+  supabase: SupabaseClient,
+  wabaId: string,
+): Promise<string[] | null> {
+  const { data, error } = await supabase
+    .from('whatsapp_config')
+    .select('id')
+    .eq('waba_id', wabaId)
+
+  if (error) {
+    console.error('[template-webhook] failed to resolve WABA channels:', wabaId, error.message)
+    return null
+  }
+  return (data ?? []).map((row) => row.id as string)
+}
+
 /**
- * Dispatch a single change record to the matching handler. Returns
- * silently on unrecognised fields — the caller already pre-filtered
- * via isTemplateWebhookField, but treat unknown values as no-ops
- * defensively in case Meta adds new template fields later.
+ * Dispatch a single template change. `wabaId` should be Meta's webhook
+ * `entry.id`. It remains optional only for backwards-compatible unit callers;
+ * production webhook routing always supplies it. If omitted, the old global
+ * meta_template_id lookup is retained with a warning rather than silently
+ * dropping lifecycle events in older integrations.
  */
 export async function handleTemplateWebhookChange(
   change: TemplateWebhookChange,
-  // SupabaseClient typed loosely — the webhook route lazy-initialises
-  // the admin client and exposes it as `any`. Type as the generic
-  // SupabaseClient here so this module is testable in isolation.
   supabase: SupabaseClient,
+  wabaId?: string,
 ): Promise<void> {
+  if (!wabaId) {
+    console.warn(
+      '[template-webhook] template lifecycle event has no WABA context; falling back to legacy meta_template_id lookup',
+    )
+  }
+
   switch (change.field) {
     case 'message_template_status_update':
-      await handleStatusUpdate(
-        change.value as TemplateStatusUpdateValue,
-        supabase,
-      )
+      await handleStatusUpdate(change.value as TemplateStatusUpdateValue, supabase, wabaId)
       return
     case 'message_template_quality_update':
-      await handleQualityUpdate(
-        change.value as TemplateQualityUpdateValue,
-        supabase,
-      )
+      await handleQualityUpdate(change.value as TemplateQualityUpdateValue, supabase, wabaId)
       return
     case 'message_template_components_update':
-      handleComponentsUpdate(
-        change.value as TemplateComponentsUpdateValue,
-      )
+      handleComponentsUpdate(change.value as TemplateComponentsUpdateValue, wabaId)
       return
   }
 }
@@ -104,11 +104,10 @@ export async function handleTemplateWebhookChange(
 async function handleStatusUpdate(
   value: TemplateStatusUpdateValue,
   supabase: SupabaseClient,
+  wabaId?: string,
 ): Promise<void> {
   const metaTemplateId =
-    value.message_template_id !== undefined
-      ? String(value.message_template_id)
-      : null
+    value.message_template_id !== undefined ? String(value.message_template_id) : null
   if (!metaTemplateId || !value.event) {
     console.warn(
       '[template-webhook] status update missing message_template_id or event:',
@@ -118,11 +117,6 @@ async function handleStatusUpdate(
   }
 
   const status = normalizeStatus(value.event)
-
-  // Persist the rejection reason on REJECTED — that's the only event
-  // where Meta sends a human-readable explanation. Clear it on any
-  // other status flip so the UI doesn't show a stale REJECTED banner
-  // after Meta re-approves a resubmitted template.
   const update: Record<string, unknown> = {
     status,
     rejection_reason:
@@ -130,12 +124,23 @@ async function handleStatusUpdate(
     submission_error: null,
   }
 
-  const { data, error } = await supabase
+  let channelIds: string[] | null = null
+  if (wabaId) {
+    channelIds = await channelIdsForWaba(supabase, wabaId)
+    if (channelIds === null) return
+    if (channelIds.length === 0) {
+      console.warn('[template-webhook] status update received for unconfigured WABA:', wabaId)
+      return
+    }
+  }
+
+  let query = supabase
     .from('message_templates')
     .update(update)
     .eq('meta_template_id', metaTemplateId)
-    .select('id')
+  if (channelIds) query = query.in('whatsapp_config_id', channelIds)
 
+  const { data, error } = await query.select('id')
   if (error) {
     console.error(
       '[template-webhook] status update failed for meta_template_id',
@@ -149,12 +154,7 @@ async function handleStatusUpdate(
       '[template-webhook] status update received for unknown template:',
       metaTemplateId,
       value.message_template_name,
-    )
-    return
-  }
-  if (data.length > 1) {
-    console.warn(
-      `[template-webhook] status update matched ${data.length} rows for meta_template_id ${metaTemplateId} — investigate.`,
+      wabaId ? `WABA ${wabaId}` : '',
     )
   }
 }
@@ -162,11 +162,10 @@ async function handleStatusUpdate(
 async function handleQualityUpdate(
   value: TemplateQualityUpdateValue,
   supabase: SupabaseClient,
+  wabaId?: string,
 ): Promise<void> {
   const metaTemplateId =
-    value.message_template_id !== undefined
-      ? String(value.message_template_id)
-      : null
+    value.message_template_id !== undefined ? String(value.message_template_id) : null
   if (!metaTemplateId) {
     console.warn(
       '[template-webhook] quality update missing message_template_id:',
@@ -181,11 +180,23 @@ async function handleQualityUpdate(
       ? (raw.toUpperCase() as 'GREEN' | 'YELLOW' | 'RED')
       : null
 
-  const { error } = await supabase
+  let channelIds: string[] | null = null
+  if (wabaId) {
+    channelIds = await channelIdsForWaba(supabase, wabaId)
+    if (channelIds === null) return
+    if (channelIds.length === 0) {
+      console.warn('[template-webhook] quality update received for unconfigured WABA:', wabaId)
+      return
+    }
+  }
+
+  let query = supabase
     .from('message_templates')
     .update({ quality_score: score })
     .eq('meta_template_id', metaTemplateId)
+  if (channelIds) query = query.in('whatsapp_config_id', channelIds)
 
+  const { error } = await query
   if (error) {
     console.error(
       '[template-webhook] quality update failed for meta_template_id',
@@ -196,20 +207,19 @@ async function handleQualityUpdate(
 }
 
 /**
- * Meta auto-modified the template (typically a category reclassification
- * — e.g. Marketing → Utility after content review).
- *
- * For v1 we just log and let the user pull updated components via the
- * existing "Sync from Meta" button — persisting Meta's modified
- * components without showing the user would silently change what they
- * thought they submitted. A future PR could mark the row with a
- * "Meta modified this template" banner.
+ * Meta auto-modified the template (typically category reclassification).
+ * We log and let the operator sync the WABA so the UI never silently changes
+ * submitted content behind their back.
  */
-function handleComponentsUpdate(value: TemplateComponentsUpdateValue): void {
+function handleComponentsUpdate(
+  value: TemplateComponentsUpdateValue,
+  wabaId?: string,
+): void {
   console.info(
     '[template-webhook] components updated by Meta for template',
     value.message_template_id,
     value.message_template_name,
+    wabaId ? `in WABA ${wabaId}` : '',
     '— run "Sync from Meta" in Settings to pull the new components.',
   )
 }
