@@ -20,9 +20,16 @@ export function registerBroadcastTools(server: McpServer, client: WacrmClient): 
     {
       title: 'Send broadcast',
       description:
-        'Launch a template broadcast to a list of recipients (up to 1000). This sends a real WhatsApp template message to every recipient — a mass, irreversible action. You MUST set confirm=true, and you should show the full recipient list and template to the user for approval before calling. The call returns fast; poll get_broadcast for delivery progress.',
+        'Launch a template broadcast to a list of recipients (up to 1000). This sends a real WhatsApp template message to every recipient — a mass, irreversible action. In a multi-number workspace, pass channel_id for the exact sending number; omitted uses the primary channel. You MUST set confirm=true, and you should show the sending channel, full recipient list, and template to the user for approval before calling. The call returns fast; poll get_broadcast for delivery progress.',
       inputSchema: {
         name: z.string().describe('A name for this broadcast campaign (for your own reference).'),
+        channel_id: z
+          .string()
+          .uuid()
+          .optional()
+          .describe(
+            'WhatsApp channel UUID to send from. Recommended for multi-number workspaces; omitted uses the primary channel.',
+          ),
         template_name: z.string().describe('Meta-approved template name.'),
         template_language: z.string().describe('Template language code, e.g. "en_US".'),
         recipients: z
@@ -53,8 +60,8 @@ export function registerBroadcastTools(server: McpServer, client: WacrmClient): 
       if (confirm !== true) {
         return errorResult(
           'Refusing to send: confirm must be true. This launches a mass broadcast to ' +
-            `${body.recipients.length} recipient(s). Confirm the recipient list and template ` +
-            'with the user, then call again with confirm=true.',
+            `${body.recipients.length} recipient(s). Confirm the sending channel, recipient list, ` +
+            'and template with the user, then call again with confirm=true.',
         );
       }
       return jsonResult(await client.sendBroadcast(body));
