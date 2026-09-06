@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { useSearchParams } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
 import type { MessageTemplate } from "@/types";
 import { Button } from "@/components/ui/button";
@@ -23,6 +22,7 @@ import {
   Loader2,
 } from "lucide-react";
 import { extractVariableIndices } from "@/lib/whatsapp/template-validators";
+import { useActiveConversationId } from "@/components/inbox/active-conversation-context";
 import { useTranslations } from "next-intl";
 
 export interface TemplateSendValues {
@@ -76,8 +76,7 @@ export function TemplatePicker({
   onSelect,
 }: TemplatePickerProps) {
   const t = useTranslations("Inbox.templatePicker");
-  const searchParams = useSearchParams();
-  const conversationId = searchParams.get("c");
+  const conversationId = useActiveConversationId();
 
   const [templates, setTemplates] = useState<MessageTemplate[]>([]);
   const [loading, setLoading] = useState(true);
@@ -105,10 +104,6 @@ export function TemplatePicker({
         return;
       }
 
-      // A template must come from the same WhatsApp channel as the active
-      // conversation. Names can overlap across WABAs, and showing another
-      // channel's copy here gives the agent a preview that the backend cannot
-      // safely send from this thread.
       const { data: conversation, error: conversationError } = await supabase
         .from("conversations")
         .select("whatsapp_config_id")
