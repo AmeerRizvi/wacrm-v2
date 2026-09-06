@@ -84,6 +84,11 @@ BEGIN
 
   IF NOT EXISTS (
     SELECT 1 FROM pg_trigger
+    WHERE tgname = 'backfill_messages_after_conversation_channel_bind' AND NOT tgisinternal
+  ) THEN RAISE EXCEPTION 'legacy conversation history channel backfill trigger is missing'; END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_trigger
     WHERE tgname = 'enforce_conversation_whatsapp_channel_account' AND NOT tgisinternal
   ) THEN RAISE EXCEPTION 'conversation tenant/channel guard is missing'; END IF;
 
