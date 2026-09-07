@@ -157,6 +157,7 @@ const nextConfig: NextConfig = {
         source: "/:path*",
         headers: [...SECURITY_HEADERS],
       },
+      { source: "/sw.js", headers: [{ key: "Cache-Control", value: "no-store" }] },
     ];
   },
 };

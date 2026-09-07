@@ -32,6 +32,7 @@ export const metadata: Metadata = {
   },
   icons: {
     icon: [{ url: "/icon" }],
+    apple: [{ url: "/pwa-192.png" }],
   },
   formatDetection: {
     email: false,
