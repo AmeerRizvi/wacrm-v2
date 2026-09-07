@@ -39,9 +39,10 @@ declare module '@/types' {
     whatsapp_config_id: string | null
     /**
      * Campaign-wide structured send-time values frozen at creation, such as a
-     * media-header override. Resume/Retry must reuse these exact values.
+     * media-header override. Optional here only for pre-050 object literals;
+     * migration 050 makes the database column NOT NULL with an empty-object default.
      */
-    template_message_params: Record<string, unknown>
+    template_message_params?: Record<string, unknown>
   }
 
   interface BroadcastRecipient {
