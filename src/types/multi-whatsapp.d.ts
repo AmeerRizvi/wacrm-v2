@@ -1,4 +1,4 @@
-// Multi-channel fields added by migrations 040-043.
+// Multi-channel fields added by migrations 040-050.
 //
 // Keep these as module augmentations until the older monolithic `src/types`
 // file is regenerated from the database schema. This makes channel identity
@@ -37,6 +37,11 @@ declare module '@/types' {
     account_id: string
     /** Sending channel frozen when the campaign is planned. */
     whatsapp_config_id: string | null
+    /**
+     * Campaign-wide structured send-time values frozen at creation, such as a
+     * media-header override. Resume/Retry must reuse these exact values.
+     */
+    template_message_params: Record<string, unknown>
   }
 
   interface BroadcastRecipient {
