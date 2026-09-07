@@ -27,6 +27,7 @@ import {
 } from '@/lib/whatsapp/phone-utils';
 import { resolveTemplateRow } from '@/lib/whatsapp/template-body';
 import type { MessageTemplate } from '@/types';
+import type { SendTimeParams } from '@/lib/whatsapp/template-send-builder';
 import { findOrCreateContact } from '@/lib/api/v1/contacts';
 
 /** Thrown by createBroadcast on a caller-visible failure; route maps it. */
@@ -55,12 +56,18 @@ export interface CreateBroadcastParams {
   recipients: BroadcastRecipientInput[];
   /** Explicit WhatsApp channel. Alias handling belongs to the HTTP route. */
   channelId?: string | null;
+  /**
+   * Campaign-wide structured send-time values such as a media-header override.
+   * Persisted atomically so Resume/Retry reproduces the original Meta payload.
+   */
+  templateMessageParams?: SendTimeParams | null;
 }
 
 interface PlannedRecipient {
   recipientRowId: string;
   phone: string;
   params: string[];
+  messageParams?: SendTimeParams;
 }
 
 export interface BroadcastPlan {
@@ -225,7 +232,15 @@ export async function createBroadcast(
       400,
     );
   }
+  if (resolvedTemplate.row.status !== 'APPROVED') {
+    throw new BroadcastError(
+      'template_not_approved',
+      `Template is ${resolvedTemplate.row.status} on the selected WhatsApp channel.`,
+      409,
+    );
+  }
   const templateRow = resolvedTemplate.row;
+  const templateMessageParams = params.templateMessageParams ?? {};
 
   // Resolve each recipient to a contact. Invalid phones are dropped
   // (counted as rejected) rather than aborting the whole broadcast.
@@ -266,9 +281,9 @@ export async function createBroadcast(
     );
   }
 
-  // Migration 042 adds an explicit channel overload of the atomic creation RPC.
-  // Passing the channel into the SECURITY DEFINER function prevents privileged
-  // code from depending on trigger guessing.
+  // Migration 050 exposes one canonical atomic creation RPC. In addition to
+  // the channel and frozen body params, it persists structured campaign-wide
+  // send-time values so Resume/Retry cannot silently change media headers.
   const { data: createdRows, error: createErr } = await db.rpc(
     'create_broadcast_with_recipients',
     {
@@ -281,6 +296,7 @@ export async function createBroadcast(
       p_contact_ids: deduped.map((r) => r.contactId),
       p_template_params: deduped.map((r) => r.params),
       p_whatsapp_config_id: config.id,
+      p_template_message_params: templateMessageParams,
     }
   );
   if (createErr || !createdRows || createdRows.length === 0) {
@@ -294,7 +310,12 @@ export async function createBroadcast(
   const planned: PlannedRecipient[] = createdRows.map(
     (row: { recipient_id: string; contact_id: string }) => {
       const r = byContact.get(row.contact_id)!;
-      return { recipientRowId: row.recipient_id, phone: r.phone, params: r.params };
+      return {
+        recipientRowId: row.recipient_id,
+        phone: r.phone,
+        params: r.params,
+        messageParams: templateMessageParams,
+      };
     }
   );
 
@@ -336,6 +357,7 @@ export async function deliverBroadcast(
           language: plan.templateLanguage,
           template: plan.templateRow ?? undefined,
           params: recipient.params,
+          messageParams: recipient.messageParams,
         });
         sentMessageId = result.messageId;
         lastError = null;
