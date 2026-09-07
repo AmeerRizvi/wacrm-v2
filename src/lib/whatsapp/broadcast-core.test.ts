@@ -21,6 +21,7 @@ vi.mock('@/lib/whatsapp/template-body', () => ({
       language: 'en_US',
       category: 'Marketing',
       body_text: 'Hello',
+      status: 'APPROVED',
       created_at: '2026-01-01T00:00:00Z',
     },
     language: 'en_US',
@@ -104,7 +105,7 @@ function makeDb(rpcResult: { data: unknown; error: unknown }) {
 }
 
 describe('createBroadcast atomicity + channel identity', () => {
-  it('passes the selected channel into the atomic RPC', async () => {
+  it('passes the selected channel and frozen message params into the atomic RPC', async () => {
     const { db, calls } = makeDb({
       data: [{ broadcast_id: 'b-1', recipient_id: 'r-1', contact_id: 'c1' }],
       error: null,
@@ -113,18 +114,42 @@ describe('createBroadcast atomicity + channel identity', () => {
     const plan = await createBroadcast(db, 'acc', 'user', {
       templateName: 'promo',
       channelId: 'wa-1',
+      templateMessageParams: { headerMediaUrl: 'https://cdn.example/header.jpg' },
       recipients: [{ to: '+14155550123' }],
     });
 
     expect(calls.rpc).toHaveLength(1);
     expect(calls.rpc[0].name).toBe('create_broadcast_with_recipients');
     expect(calls.rpc[0].args.p_whatsapp_config_id).toBe('wa-1');
+    expect(calls.rpc[0].args.p_template_message_params).toEqual({
+      headerMediaUrl: 'https://cdn.example/header.jpg',
+    });
     expect(calls.usedDirectInsert).toBe(0);
     expect(plan.broadcastId).toBe('b-1');
     expect(plan.whatsappConfigId).toBe('wa-1');
     expect(plan.planned).toEqual([
-      { recipientRowId: 'r-1', phone: '14155550123', params: [] },
+      {
+        recipientRowId: 'r-1',
+        phone: '14155550123',
+        params: [],
+        messageParams: { headerMediaUrl: 'https://cdn.example/header.jpg' },
+      },
     ]);
+  });
+
+  it('passes an empty structured object for legacy body-only broadcasts', async () => {
+    const { db, calls } = makeDb({
+      data: [{ broadcast_id: 'b-1', recipient_id: 'r-1', contact_id: 'c1' }],
+      error: null,
+    });
+
+    await createBroadcast(db, 'acc', 'user', {
+      templateName: 'promo',
+      channelId: 'wa-1',
+      recipients: [{ to: '+14155550123' }],
+    });
+
+    expect(calls.rpc[0].args.p_template_message_params).toEqual({});
   });
 
   it('throws and leaves no orphaned parent when the atomic create fails', async () => {
