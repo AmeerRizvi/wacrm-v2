@@ -69,6 +69,16 @@ BEGIN
   ) IS NULL THEN
     RAISE EXCEPTION 'channel-aware atomic broadcast creation RPC is missing';
   END IF;
+  IF to_regprocedure(
+    'public.create_broadcast_with_recipients(uuid,uuid,text,text,text,integer,uuid[],jsonb[])'
+  ) IS NOT NULL THEN
+    RAISE EXCEPTION 'legacy 8-argument channel-blind broadcast RPC still exists — migration 047 did not apply';
+  END IF;
+  IF to_regprocedure(
+    'public.create_broadcast_with_recipients(uuid,uuid,text,text,text,integer,uuid[])'
+  ) IS NOT NULL THEN
+    RAISE EXCEPTION 'legacy 7-argument channel-blind broadcast RPC still exists';
+  END IF;
 
   IF NOT EXISTS (
     SELECT 1 FROM pg_trigger
