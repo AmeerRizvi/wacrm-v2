@@ -17,7 +17,11 @@ AS $$
 DECLARE
   v_account_id UUID;
 BEGIN
-  v_account_id := CASE WHEN TG_OP = 'DELETE' THEN OLD.account_id ELSE NEW.account_id END;
+  IF TG_OP = 'DELETE' THEN
+    v_account_id := OLD.account_id;
+  ELSE
+    v_account_id := NEW.account_id;
+  END IF;
 
   IF EXISTS (
     SELECT 1 FROM whatsapp_config wc WHERE wc.account_id = v_account_id
@@ -31,7 +35,10 @@ BEGIN
       USING ERRCODE = '23514';
   END IF;
 
-  RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+  IF TG_OP = 'DELETE' THEN
+    RETURN OLD;
+  END IF;
+  RETURN NEW;
 END;
 $$;
 
