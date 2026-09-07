@@ -20,7 +20,7 @@ export function registerReadTools(server: McpServer, client: WacrmClient): void 
     {
       title: 'Who am I',
       description:
-        'Verify the API key and show which wacrm account it is bound to and what scopes it carries. Call this first to discover what actions are possible.',
+        'Verify the API key and show its wacrm account, scopes, and safe WhatsApp channel metadata (channel UUID, label, phone_number_id, status, primary flag). Call this first when a write needs an explicit channel_id.',
       inputSchema: {},
       annotations: { ...READ_ONLY, title: 'Who am I' },
     },
