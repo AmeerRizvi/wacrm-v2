@@ -69,6 +69,11 @@ BEGIN
   ) IS NULL THEN
     RAISE EXCEPTION 'channel-aware atomic broadcast creation RPC is missing';
   END IF;
+  IF pg_get_functiondef(
+    to_regprocedure('public.create_broadcast_with_recipients(uuid,uuid,text,text,text,integer,uuid[],jsonb[],uuid)')
+  ) NOT ILIKE '%mt.status = ''APPROVED''%' THEN
+    RAISE EXCEPTION 'broadcast creation RPC does not require an APPROVED template';
+  END IF;
   IF to_regprocedure(
     'public.create_broadcast_with_recipients(uuid,uuid,text,text,text,integer,uuid[],jsonb[])'
   ) IS NOT NULL THEN
