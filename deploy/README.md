@@ -6,7 +6,7 @@ Target: CATSYS 12GB, root@207.180.251.120:22. Existing Caddy serves HTTPS.
 
 `.github/workflows/deploy.yml` checks main, runs lint/typecheck/tests, builds the existing Dockerfile, and transfers the exact commit image over SSH. Image transfer avoids adding a registry credential to the server. The image is currently built for Linux amd64; confirm server architecture before enabling.
 
-Deployments require repository variable `DEPLOY_ENABLED=true` and use the GitHub `production` environment. Configure environment reviewers if desired. Feature-branch pushes never deploy. A manual dispatch also requires main.
+Deployments require repository variable `DEPLOY_ENABLED=true` and use the GitHub `production` environment. Configure environment reviewers if desired. Deployment runs only through GitHub Actions → Deploy production → Run workflow. Select main. Pushes to any branch never trigger deployment; manual dispatch still requires main.
 
 Repository/environment variables:
 

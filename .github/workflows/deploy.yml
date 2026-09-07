@@ -1,8 +1,6 @@
 name: Deploy production
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
 concurrency:
   group: wacrm-production
   cancel-in-progress: false
