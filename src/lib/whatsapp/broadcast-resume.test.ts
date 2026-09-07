@@ -151,6 +151,7 @@ const BROADCAST = {
   template_name: 'order_update',
   template_language: 'en_US',
   whatsapp_config_id: 'wa-1',
+  template_message_params: {},
 };
 const CONFIG = {
   id: 'wa-1',
@@ -198,6 +199,28 @@ describe('planBroadcastResume', () => {
     ]);
     expect(remaining).toBe(0);
     expect(unsendable).toBe(0);
+  });
+
+  it('restores the exact persisted media-header override', async () => {
+    const { plan } = await planBroadcastResume(
+      planDb({
+        broadcast: {
+          ...BROADCAST,
+          template_message_params: {
+            headerMediaUrl: 'https://campaign.example/header.jpg',
+          },
+        },
+        config: CONFIG,
+        recipients: [recipient('r1', '+15551234567')],
+      }),
+      'acct-1',
+      'bc-1',
+      'pending',
+    );
+
+    expect(plan.planned[0].messageParams).toEqual({
+      headerMediaUrl: 'https://campaign.example/header.jpg',
+    });
   });
 
   it('refuses a legacy broadcast with no stored channel instead of guessing primary', async () => {
