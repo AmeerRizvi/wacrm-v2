@@ -4,7 +4,7 @@ wacrm supports multiple Meta WhatsApp Business Cloud API phone numbers inside on
 
 ## Mental model
 
-An **account** is the tenant/workspace. A **WhatsApp channel** is one row in `whatsapp_config` and represents one Meta `phone_number_id` plus the credentials used to operate it.
+An **account** is the tenant/workspace. A **WhatsApp channel** is one row in `whatsapp_config` and represents one immutable Meta `phone_number_id` plus the credentials used to operate it.
 
 ```text
 Account
@@ -16,26 +16,35 @@ Account
 
 Contacts remain account-global. Conversations are channel-specific, so one customer may have independent Sales and Support threads. Once a conversation is bound to a channel, that channel is the routing authority for human replies, automations, Flows and AI replies.
 
-`is_primary` is only a compatibility/default choice when a caller has no channel context. The application does not silently move established conversations, broadcasts or bot sessions when the primary changes. When a multi-channel operation is genuinely ambiguous, it fails instead of guessing.
+`is_primary` is only a compatibility/default choice when a caller has no channel context. Established conversations and broadcasts never move when the primary changes. When a multi-channel operation is ambiguous, it fails instead of guessing.
 
 ## Database migrations
 
-- `040_multi_whatsapp_channels.sql` — core channel model, conversation/message/broadcast/template bindings, primary-channel handling and legacy backfill.
-- `041_multi_channel_hardening.sql` — WABA ownership, WABA/template identity, broadcast/template validation, legacy conversation/message repair and ambiguous broadcast protection.
-- `042_multi_channel_broadcast_api.sql` — channel-aware atomic public broadcast creation RPC with SECURITY DEFINER tenant validation.
-- `043_multi_channel_relational_guards.sql` — Flow-run conversation identity and broadcast-recipient tenant/channel guards.
+The multi-channel series is deliberately layered so the core model and later audit hardening are independently reviewable:
 
-Existing encrypted credentials are preserved during the upgrade.
+- `040_multi_whatsapp_channels.sql` — channel model, entity bindings, primary handling and legacy backfill.
+- `041_multi_channel_hardening.sql` — WABA ownership, WABA/template identity, legacy-history repair and channel-safe broadcast/template guards.
+- `042_multi_channel_broadcast_api.sql` — atomic channel-aware broadcast creation RPC.
+- `043_multi_channel_relational_guards.sql` — Flow-run and broadcast-recipient account/contact/channel consistency.
+- `044_whatsapp_channel_tenant_identity.sql` — makes both phone identity and tenant ownership immutable on an existing channel.
+- `045_require_whatsapp_primary_channel.sql` — deferred invariant requiring a primary whenever an account has channels.
+- `046_drop_legacy_template_unique_index.sql` — removes the old per-user template UNIQUE INDEX that would otherwise block same-WABA templates on sibling phone channels.
+- `047_drop_legacy_broadcast_rpc_overloads.sql` — removes old channel-blind SECURITY DEFINER broadcast RPC overloads.
+- `048_whatsapp_channel_concurrency.sql` — fail-fast account-level serialization for concurrent primary/delete mutations instead of a lock cycle.
+- `049_broadcast_requires_approved_template.sql` — requires an APPROVED local template at the privileged broadcast boundary.
+- `050_persist_broadcast_template_message_params.sql` — freezes campaign-wide send-time template values (for example a media-header override) and makes the 10-argument channel-aware RPC the sole canonical broadcast creator.
 
-## Channel identity
+Existing encrypted credentials are preserved during upgrade.
 
-The old `UNIQUE(account_id)` constraint on `whatsapp_config` is removed. `phone_number_id` remains globally unique and is immutable after a channel is created. A different Meta phone number must be added as a new channel rather than rewriting an existing channel row.
+## Channel identity and tenancy
 
-When an account has channels, exactly one is maintained as primary. Primary changes and primary deletion are serialized in PostgreSQL; deleting an unused primary promotes the oldest surviving channel. Historical references use restrictive foreign keys so a channel with retained conversation/message/broadcast/template history cannot be silently deleted.
+The old `UNIQUE(account_id)` constraint on `whatsapp_config` is removed. `phone_number_id` remains globally unique. Both `phone_number_id` and `account_id` are immutable on an existing channel row; replacing a number or moving it between tenants means creating/migrating a channel explicitly, never rewriting historical identity.
 
-A WABA may contain several phone channels in the **same** workspace. The same WABA may not be split across two CRM accounts. The migration fails fast if existing data violates that ownership rule.
+When an account has channels, exactly one must be primary. The partial unique index guarantees at most one and a deferred constraint guarantees at least one. Concurrent primary/delete mutations fail fast if another transaction owns the account mutation lock instead of committing a broken state.
 
-A WABA ID may be corrected before template history exists. Once templates have been synced/submitted for a channel, changing that channel's WABA is rejected because Meta template IDs belong to the original WABA catalog.
+A WABA may contain several phone channels in the **same** workspace. The same WABA may not be split across CRM accounts. Once template history exists for a channel, changing its WABA is rejected because Meta template IDs belong to the original WABA catalog.
+
+Historical references use restrictive foreign keys, so a channel with conversation/message/broadcast/template history cannot be silently deleted.
 
 ## Channel-bound entities
 
@@ -53,191 +62,169 @@ Conversation uniqueness is:
 (account_id, contact_id, whatsapp_config_id)
 ```
 
-instead of `(account_id, contact_id)`.
+Active Flow uniqueness is conversation-scoped. Database triggers additionally protect service-role/background writers from pairing rows with another tenant's channel/contact/conversation.
 
-Active Flow uniqueness is conversation-scoped, so the same customer may independently interact with a bot on Sales and Support at the same time.
+## Upgrade and legacy NULL conversations
 
-Database guards additionally ensure that service-role and SECURITY DEFINER writers cannot pair a row with another tenant's channel/contact/conversation.
+For an existing one-number installation, migration 040 marks the existing config primary and backfills existing conversations/messages/broadcasts/templates. Old Meta-media fallback URLs are stamped with the channel ID.
 
-## Upgrade behavior
+A conversation created before any WhatsApp config existed can remain NULL-bound. The first channel-aware inbound/outbound use claims it safely. If an API/manual automation explicitly supplies a channel, that explicit choice wins over primary fallback and the conversation is bound **before** a Meta send. A uniqueness race fails before transmission and points the caller to the canonical channel thread.
 
-For an existing one-number installation:
+When a legacy conversation is bound, PostgreSQL backfills its historical messages and media proxy URLs at the same boundary.
 
-1. migration 040 marks the existing config primary;
-2. existing conversations/messages/broadcasts/templates are stamped with that config;
-3. old Meta media fallback URLs are rewritten with their channel ID;
-4. normal single-number behavior remains unchanged until another channel is added.
+## Settings and Inbox
 
-An older conversation created before any WhatsApp config existed may still have a NULL channel. Its first later inbound/outbound operation safely binds that legacy thread to a real channel. PostgreSQL then stamps its historical messages and repairs legacy media URLs at the same time.
+Settings → WhatsApp lists safe metadata for every connected number, supports add/edit/test/primary/media-mirroring operations and blocks deletion of channels that retain history. Token ciphertext is never returned by the list API.
 
-No credential re-entry is required for the existing number.
+Configuration writes require an admin before Meta registration/subscription side effects.
 
-## Settings → WhatsApp
+Inbox supports **All numbers** plus per-number filtering. Human text/media/template/interactive/reply/reaction operations resolve the exact conversation and therefore its exact sending channel.
 
-The channel manager can:
-
-- list all connected numbers without returning encrypted token ciphertext;
-- add and edit individual channels;
-- test one channel against Meta;
-- mark a channel primary;
-- toggle inbound-media mirroring per channel;
-- see registration/WABA subscription state;
-- remove an unused channel.
-
-Configuration mutations require the admin role **before** Meta registration or WABA-subscription side effects are attempted. Leaving token fields blank while editing keeps the encrypted stored values.
-
-## Inbox and human sends
-
-The Inbox supports:
-
-- **All numbers** unified view;
-- per-number filtering;
-- channel labels on threads in the unified view.
-
-The template picker is scoped to the active conversation's channel through React state/context rather than URL timing.
-
-All human outbound operations resolve the conversation first and then use its exact channel:
-
-- text
-- media
-- templates
-- interactive buttons/lists
-- quote replies
-- reactions
-
-The dashboard `POST /api/whatsapp/send` also accepts `channel_id` / `whatsapp_config_id` for contact-only sends. If the caller supplies an existing conversation plus a different channel, the request is rejected rather than rerouted.
+The dashboard send endpoint accepts `channel_id` / `whatsapp_config_id` for contact-only or legacy-thread sends. A conflicting channel on an already-bound conversation returns a conflict rather than rerouting.
 
 ## Inbound webhook routing
 
-Meta messaging changes include `metadata.phone_number_id`. The webhook resolves exactly one local channel from that value before processing statuses or messages.
+Meta messaging changes include `metadata.phone_number_id`. The webhook resolves the exact local channel before processing statuses/messages. That identity is carried through conversation routing, message persistence, media credentials, delivery/read/failure status, broadcast reply/status handling, automations, Flows, AI and public webhooks.
 
-That channel is used for:
+Meta message IDs (`wamid`) are not assumed globally unique across phone numbers. Lookups use channel or conversation identity as appropriate.
 
-- conversation routing;
-- inbound message persistence;
-- media credentials;
-- delivery/read/failure statuses;
-- broadcast recipient statuses;
-- broadcast reply tracking;
-- automation context;
-- Flow dispatch;
-- AI auto-reply context;
-- public webhook payloads.
-
-Meta message IDs (`wamid`) are not treated as globally unique across phone numbers. Status and Flow prompt/idempotency lookups are scoped by channel or conversation as appropriate.
+Template lifecycle events are WABA-scoped using webhook `entry.id`. Events without WABA context are dropped instead of globally updating same-ID/name template copies.
 
 ## Automations, Flows and AI
 
-Bot/workflow senders do **not** query an account-level WhatsApp config with `.single()`. They resolve the exact channel attached to the conversation.
+Automation and Flow send adapters resolve credentials from the conversation, not an account-wide WhatsApp config. Templates are resolved inside that same channel and outbound messages are stamped with the same channel.
 
-Automation sends:
+Delayed automations persist their original context. Manual automation execution validates `account + contact + conversation`; when it supplies an explicit channel for a legacy NULL conversation, the route binds that channel before switching to service-role execution.
 
-- validate account/contact/conversation ownership;
-- use the conversation channel;
-- resolve templates inside that channel;
-- stamp outbound messages with `whatsapp_config_id`.
+Flow runtime/idempotency is conversation-scoped. Support traffic cannot advance a Sales run for the same contact.
 
-Conversation mutations such as **Assign conversation** and **Close conversation** act on one verified conversation. They no longer update every Sales/Support thread belonging to the contact. Delayed executions preserve the triggering conversation/channel context. A contact-only automation with several possible WhatsApp conversations fails unless the context disambiguates the target.
-
-Flow runtime state is also conversation-scoped. Incoming Support traffic cannot advance a Sales Flow run. Prompt-message lookup and duplicate-inbound protection use the exact conversation instead of WAMID alone. Flow handoff validates the target agent as a member of the same account and updates only the run's conversation.
-
-AI auto-replies use the same conversation-channel sender as Flow text sends, so they inherit the receiving number automatically.
+AI auto-reply validates account/contact/conversation identity before mutations and sends through the conversation-channel sender. Draft generation is read-only and RLS/account scoped.
 
 ## Broadcasts
 
-A broadcast permanently stores its sending channel, and every recipient inherits that same channel.
+A broadcast permanently stores its sending channel, and every recipient inherits it. Browser wizard, public API and Resume/Retry share the same privileged atomic creation model.
 
-The browser wizard carries the selected template's channel through:
+The canonical RPC is:
 
 ```text
-template selection
-→ broadcast row
-→ recipient rows
-→ every send batch
+create_broadcast_with_recipients(
+  account,
+  audit_user,
+  name,
+  template_name,
+  language,
+  total,
+  contact_ids,
+  per_recipient_body_params,
+  whatsapp_config_id,
+  template_message_params
+)
 ```
 
-The immediate broadcast API and public `POST /api/v1/broadcasts` accept `channel_id` / `whatsapp_config_id`. A legacy caller may omit it only when template/channel resolution is unambiguous. If the same template exists on multiple channels, the API returns a conflict instead of selecting primary.
+The RPC is service-role only and validates:
 
-Public broadcast creation uses the channel-aware atomic `create_broadcast_with_recipients(..., p_whatsapp_config_id)` RPC. Because it is SECURITY DEFINER, the function validates:
-
-- audit user membership;
+- audit-user membership;
 - selected channel ownership;
-- template availability on that channel;
-- recipient array cardinality;
-- every contact's account ownership.
+- selected template belongs to that channel **and is APPROVED**;
+- recipient-array cardinality;
+- every contact belongs to the account;
+- structured send-time params are a JSON object.
 
-Resume/Retry reconstructs delivery from the broadcast's stored `whatsapp_config_id`. Changing workspace primary after campaign creation cannot move a retry to another number. A legacy broadcast that has no safe stored channel is refused for resume rather than guessed.
+Old 7-, 8- and 9-argument privileged overloads are removed so callers cannot bypass channel/send-time validation.
+
+### Atomic browser campaign creation
+
+The dashboard wizard resolves the entire audience and freezes each recipient's body parameters first. A cookie-authenticated server endpoint then calls the same atomic RPC, creating the parent and **all** recipient rows in one transaction. A failure cannot leave a broadcast with only part of its audience persisted.
+
+### Resume/Retry fidelity
+
+Resume/Retry always reads the broadcast's stored `whatsapp_config_id`; changing workspace primary cannot move a campaign to another number.
+
+Migration 050 also persists `broadcasts.template_message_params`. This matters for media-header templates: a campaign-specific image/video/document override used for the first batch is restored exactly after interruption. Resume is not allowed to silently fall back to a different `message_templates.header_media_url`.
+
+Both creation and Resume refuse templates that are no longer `APPROVED`.
+
+The low-level batch sender independently enforces exact channel + synced APPROVED template, so bypassing the wizard cannot bypass lifecycle validation.
 
 ## Templates and WABAs
 
-Meta message-template catalogs are **WABA-scoped**, while wacrm sends are **phone-channel-scoped**. Local template copies are therefore stored per phone channel for deterministic sends.
+Meta template catalogs are WABA-scoped while message sends are phone-channel-scoped. wacrm stores deterministic local copies per phone channel.
 
-When several channels in the same workspace share one WABA:
+For sibling channels sharing one WABA, Sync/Submit/Edit/Delete/Lifecycle operations mutate Meta once and mirror/update only channels belonging to that WABA.
 
-- **Sync** fetches Meta once and mirrors the catalog to sibling channels;
-- **Submit** creates the Meta template once and updates sibling local copies;
-- **Edit** changes Meta once and updates sibling copies;
-- **Delete** removes Meta once and removes sibling copies;
-- **Lifecycle webhooks** use Meta webhook `entry.id` (the WABA) and update only copies belonging to that WABA.
+Migration 046 is important: migration 014 created `message_templates_user_name_language_key` as a UNIQUE **INDEX**, not a table constraint. It must be dropped as an index or same template names on sibling phone channels remain impossible.
 
-A lifecycle event without WABA context is dropped. The handler never falls back to globally updating rows by `meta_template_id` alone.
-
-Settings → Templates has an explicit WhatsApp-number selector and uses account-level visibility rather than the logged-in creator's `user_id`.
+Settings → Templates includes an explicit channel selector and account-level visibility.
 
 ## Media
 
-Mirrored inbound media is durable and no longer needs Meta credentials. If mirroring is disabled or fails, the fallback proxy URL still contains `channel_id` so the correct channel token is used later.
+Inbound mirrored media is durable. Fallback proxy URLs carry `channel_id`, and old proxy URLs attempt to recover channel identity from their stored message rather than guessing primary.
 
-For old/bookmarked proxy URLs without a channel parameter, the media endpoint first attempts to recover the channel from the stored message. A multi-number workspace is not allowed to guess an arbitrary primary channel when the media's ownership cannot be resolved.
+Broadcast media-header overrides are campaign state, not template state, and are persisted as described above.
 
-## Public API
+## Public API and MCP
 
-`POST /api/v1/messages` accepts:
+`POST /api/v1/messages` accepts `channel_id` (with `whatsapp_config_id` as alias). Omission preserves primary as the compatibility default only for new phone-based sends.
+
+Public conversation/message serializers expose `channel_id`, and conversation lists can filter by it.
+
+`GET /api/v1/me` exposes safe WhatsApp-channel discovery metadata:
 
 ```json
 {
-  "to": "+971500000000",
-  "type": "text",
-  "text": "Hello",
-  "channel_id": "<whatsapp_config uuid>"
+  "whatsapp_channels": [
+    {
+      "id": "<channel uuid>",
+      "label": "Support UAE",
+      "phone_number_id": "<meta phone number id>",
+      "status": "connected",
+      "is_primary": false
+    }
+  ]
 }
 ```
 
-`whatsapp_config_id` is accepted as an alias. If omitted, primary remains the compatibility default for a new phone-based send.
+No access/verify tokens are included. MCP can therefore discover the UUID before an explicit-channel message, broadcast or conversation filter instead of guessing it.
 
-Public conversation/message serializers return `channel_id`, and public broadcast create/status responses return the broadcast `channel_id`, so integrations can preserve number identity across subsequent requests.
+The MCP client and write/read tool schemas pass `channel_id` through to `/api/v1`. CI has a separate MCP install/typecheck/build job in addition to the main app job.
 
 ## Operational checklist
 
-For each production number:
+1. Add each channel in Settings → WhatsApp.
+2. Supply Phone Number ID, WABA ID, token and registration PIN where required.
+3. Ensure the WABA is subscribed and test the channel.
+4. In Settings → Templates, select the number and sync its WABA catalog.
+5. Send inbound traffic to each number and confirm distinct channel-labelled conversations.
+6. Reply/template/react on each conversation and verify the same Meta number sends.
+7. Trigger Automation, Flow and AI paths on multiple channels for the same contact.
+8. Create a broadcast and confirm its From channel.
+9. For a media-header campaign, use a campaign-specific asset, interrupt delivery, then Resume and verify the same asset/channel are reused.
+10. Change primary and retry an older campaign; it must remain on its original channel.
+11. Exercise public API/MCP channel discovery and explicit-channel sends.
 
-1. Add the channel in Settings → WhatsApp.
-2. Supply Phone Number ID, WABA ID and an appropriately permissioned token.
-3. Supply the registration PIN where required.
-4. Ensure the WABA is subscribed to the app.
-5. Test the channel from Settings.
-6. Open Settings → Templates, choose that number and sync the WABA catalog.
-7. Send an inbound message and confirm the correct channel label appears.
-8. Reply from the Inbox and verify Meta sends from the same number.
-9. Trigger an automation/Flow on that conversation and verify the bot reply uses the same number.
-10. Create a test broadcast and confirm its displayed **From** channel before sending.
-11. Retry that broadcast after changing primary and confirm it still uses its original channel.
+## Verification and release gate
 
-## Verification
+`supabase/ci/verify-schema.sql` asserts channel columns/indexes, primary invariants, tenant/relational triggers, absence of old template/RPC uniqueness paths, the canonical 10-argument broadcast RPC, APPROVED-template validation, persisted structured broadcast params and fail-fast channel mutation locking.
 
-`supabase/ci/verify-schema.sql` asserts the channel columns, indexes, conversation-scoped Flow uniqueness, channel-aware privileged broadcast RPC and relational hardening triggers after a clean migration replay.
-
-The repository tests have been updated to cover exact-channel conversation resolution/sending, WABA-scoped lifecycle updates, Flow conversation ownership, channel-aware broadcast creation and stored-channel Resume/Retry.
-
-Before deployment, actually execute:
+Before deployment, execute the main application checks:
 
 ```bash
+npm ci
 npm run lint
 npm run typecheck
 npm test
 npm run build
 ```
 
-and replay all Supabase migrations from a clean database followed by `supabase/ci/verify-schema.sql`.
+and the MCP checks:
 
-The feature PR must remain Draft until those executable checks pass.
+```bash
+cd mcp-server
+npm ci
+npm run typecheck
+npm run build
+```
+
+Then replay **all** Supabase migrations from a clean database and execute `supabase/ci/verify-schema.sql`.
+
+The feature PR must remain **Draft** until those executable checks pass. Static auditing is not a substitute for TypeScript compilation, tests, Next.js build or PostgreSQL migration execution.
