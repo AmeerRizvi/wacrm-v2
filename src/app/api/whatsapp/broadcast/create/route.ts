@@ -1,8 +1,37 @@
 import { NextResponse } from 'next/server'
 import { requireRole, toErrorResponse } from '@/lib/auth/account'
 import { supabaseAdmin } from '@/lib/flows/admin-client'
+import type { SendTimeParams } from '@/lib/whatsapp/template-send-builder'
 
 const MAX_RECIPIENTS = 1000
+
+function sanitizeTemplateMessageParams(raw: unknown): SendTimeParams {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {}
+  const input = raw as Record<string, unknown>
+  const out: SendTimeParams = {}
+
+  if (typeof input.headerMediaUrl === 'string' && input.headerMediaUrl.trim()) {
+    out.headerMediaUrl = input.headerMediaUrl.trim()
+  }
+  if (typeof input.headerMediaId === 'string' && input.headerMediaId.trim()) {
+    out.headerMediaId = input.headerMediaId.trim()
+  }
+  if (typeof input.headerText === 'string' && input.headerText.trim()) {
+    out.headerText = input.headerText
+  }
+  if (input.buttonParams && typeof input.buttonParams === 'object' && !Array.isArray(input.buttonParams)) {
+    const buttonParams: Record<number, string> = {}
+    for (const [key, value] of Object.entries(input.buttonParams as Record<string, unknown>)) {
+      const index = Number(key)
+      if (Number.isInteger(index) && index >= 0 && typeof value === 'string') {
+        buttonParams[index] = value
+      }
+    }
+    if (Object.keys(buttonParams).length > 0) out.buttonParams = buttonParams
+  }
+
+  return out
+}
 
 export async function POST(request: Request) {
   try {
@@ -25,6 +54,7 @@ export async function POST(request: Request) {
       ? body.contact_ids.filter((id: unknown): id is string => typeof id === 'string' && Boolean(id))
       : []
     const rawParams = Array.isArray(body.template_params) ? body.template_params : []
+    const templateMessageParams = sanitizeTemplateMessageParams(body.template_message_params)
 
     if (!name || !templateName || !channelId) {
       return NextResponse.json(
@@ -64,9 +94,9 @@ export async function POST(request: Request) {
     const params = ids.map((id) => deduped.get(id) ?? [])
 
     // Use the same privileged, channel-aware transaction as the public API.
-    // The RPC validates audit-user membership, channel ownership, template
-    // availability on that channel, array cardinality, and every contact before
-    // it writes either the broadcast or any recipient row.
+    // Migration 050 also freezes campaign-wide structured send-time values
+    // (for example a media-header override) in that same transaction so a
+    // resumed campaign reconstructs the exact original Meta payload.
     const { data: createdRows, error: createError } = await supabaseAdmin().rpc(
       'create_broadcast_with_recipients',
       {
@@ -79,6 +109,7 @@ export async function POST(request: Request) {
         p_contact_ids: ids,
         p_template_params: params,
         p_whatsapp_config_id: channelId,
+        p_template_message_params: templateMessageParams,
       },
     )
 
@@ -92,9 +123,10 @@ export async function POST(request: Request) {
 
     const broadcastId = createdRows[0].broadcast_id as string
 
-    // These fields are descriptive UI metadata; recipient send parameters have
-    // already been frozen atomically by the RPC. A metadata write failure must
-    // not encourage the browser to retry creation and duplicate a campaign.
+    // These are descriptive UI metadata only. Routing identity, recipients,
+    // body params and structured send-time params are already durable inside
+    // the atomic RPC. A metadata write failure therefore cannot change what a
+    // later Resume/Retry sends.
     const { error: metadataError } = await supabase
       .from('broadcasts')
       .update({
@@ -119,6 +151,7 @@ export async function POST(request: Request) {
       broadcast_id: broadcastId,
       channel_id: channelId,
       total_recipients: ids.length,
+      template_message_params: templateMessageParams,
       metadata_saved: !metadataError,
     })
   } catch (error) {
