@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   check:
-    name: Lint, typecheck, test, build
+    name: App lint, typecheck, test, build
     runs-on: ubuntu-latest
     # Dummy env vars so `next build` doesn't fail when it reads the
     # public Supabase config at build time. These never leave CI and
@@ -50,4 +50,28 @@ jobs:
         run: npm test
 
       - name: Build
+        run: npm run build
+
+  mcp:
+    name: MCP typecheck and build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mcp-server
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: mcp-server/package-lock.json
+
+      - name: Install MCP dependencies
+        run: npm ci
+
+      - name: Typecheck MCP server
+        run: npm run typecheck
+
+      - name: Build MCP server
         run: npm run build
