@@ -76,9 +76,6 @@ interface UseBroadcastSendingReturn {
 const SEND_BATCH_SIZE = 10;
 const SEND_BATCH_DELAY_MS = 1000;
 
-/** `broadcast_recipients` inserts are independent of the send rate. */
-const INSERT_BATCH_SIZE = 200;
-
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -355,16 +352,10 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
     const supabase = createClient();
 
     try {
-      // ── Step 0: Resolve current user ──────────────────────────────
-      // broadcasts.user_id is NOT NULL + guarded by RLS
-      // (auth.uid() = user_id). Without this, the INSERT below was
-      // silently failing with 23502 / 42501 — the wizard would
-      // no-op with no feedback.
       const {
         data: { session },
       } = await supabase.auth.getSession();
-      const user = session?.user;
-      if (!user) {
+      if (!session?.user) {
         throw new Error('You are not signed in.');
       }
       if (!accountId) {
@@ -386,50 +377,10 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
         throw new Error('No contacts found for this audience.');
       }
 
-      // ── Step 2: Create broadcast row ──────────────────────────────
-      setProgress(10);
-      const { data: broadcast, error: broadcastError } = await supabase
-        .from('broadcasts')
-        .insert({
-          user_id: user.id,
-          account_id: accountId,
-          whatsapp_config_id: channelId,
-          name: payload.name,
-          template_name: payload.template.name,
-          template_language: payload.template.language ?? 'en_US',
-          template_variables: payload.variables,
-          audience_filter: {
-            type: payload.audience.type,
-            tagIds: payload.audience.tagIds,
-            customField: payload.audience.customField,
-            excludeTagIds: payload.audience.excludeTagIds,
-          },
-          status: 'sending',
-          total_recipients: contacts.length,
-          sent_count: 0,
-          delivered_count: 0,
-          read_count: 0,
-          replied_count: 0,
-          failed_count: 0,
-        })
-        .select()
-        .single();
-
-      if (broadcastError || !broadcast) {
-        throw new Error(
-          `Failed to create broadcast: ${broadcastError?.message ?? 'unknown error'}`,
-        );
-      }
-
-      // ── Step 3: Insert recipient rows ─────────────────────────────
-      // Custom values are fetched BEFORE the insert so each row can
-      // carry its resolved template params. Those params are what makes
-      // the campaign resumable server-side (issue #472): the send loop
-      // below runs in this browser tab, and if the tab goes away the
-      // only record of what {{1}} should be for each contact is this
-      // column. Resolving once here also means the resume sends exactly
-      // what this pass would have.
-      setProgress(20);
+      // Resolve and freeze every recipient's template params BEFORE campaign
+      // creation. The atomic server route persists these values together with
+      // the parent broadcast so a tab crash can never leave a half-built plan.
+      setProgress(12);
       const customValueIndex = await fetchCustomValueIndex(
         supabase,
         contacts.map((c) => c.id),
@@ -444,44 +395,42 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
           ),
         ]),
       );
-      const recipientRows = contacts.map((contact) => ({
-        broadcast_id: broadcast.id,
-        contact_id: contact.id,
-        whatsapp_config_id: channelId,
-        status: 'pending' as const,
-        template_params: paramsByContact.get(contact.id) ?? [],
-      }));
 
-      for (let i = 0; i < recipientRows.length; i += INSERT_BATCH_SIZE) {
-        const batch = recipientRows.slice(i, i + INSERT_BATCH_SIZE);
-        const { error: recipientError } = await supabase
-          .from('broadcast_recipients')
-          .insert(batch);
-        if (recipientError) {
-          // Previous impl logged and marched on — the broadcast then ran
-          // with an incomplete recipient set, so webhook status updates
-          // couldn't find some rows and the aggregate counts drifted.
-          // Flip the broadcast to failed so the user sees the problem
-          // immediately, then throw to abort the send loop.
-          await supabase
-            .from('broadcasts')
-            .update({
-              status: 'failed',
-              failed_count: contacts.length,
-            })
-            .eq('id', broadcast.id);
-          throw new Error(
-            `Failed to insert recipient batch ${i / INSERT_BATCH_SIZE + 1}: ${recipientError.message}`,
-          );
-        }
+      // ── Step 2: Atomically create parent + every recipient ─────────
+      setProgress(20);
+      const createRes = await fetch('/api/whatsapp/broadcast/create', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: payload.name,
+          template_name: payload.template.name,
+          template_language: payload.template.language ?? 'en_US',
+          channel_id: channelId,
+          contact_ids: contacts.map((contact) => contact.id),
+          template_params: contacts.map(
+            (contact) => paramsByContact.get(contact.id) ?? [],
+          ),
+          template_variables: payload.variables,
+          audience_filter: {
+            type: payload.audience.type,
+            tagIds: payload.audience.tagIds,
+            customField: payload.audience.customField,
+            excludeTagIds: payload.audience.excludeTagIds,
+          },
+        }),
+      });
+      const created = await createRes.json().catch(() => ({}));
+      if (!createRes.ok || !created.broadcast_id) {
+        throw new Error(created.error || 'Failed to create broadcast');
       }
+      const broadcastId = created.broadcast_id as string;
 
-      // ── Step 4: Fetch recipients back (joined contact) ────────────
+      // ── Step 3: Fetch the atomically-created plan with contacts ────
       setProgress(30);
       const { data: recipients, error: recipientsFetchError } = await supabase
         .from('broadcast_recipients')
         .select('*, contact:contacts(*)')
-        .eq('broadcast_id', broadcast.id);
+        .eq('broadcast_id', broadcastId);
 
       if (recipientsFetchError || !recipients) {
         throw new Error('Failed to fetch broadcast recipients');
@@ -612,7 +561,7 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
         }
       }
 
-      // ── Step 5: Finalize status ───────────────────────────────────
+      // ── Step 4: Finalize status ───────────────────────────────────
       // Aggregate counts are maintained by the DB trigger (migration
       // 003); we only flip the final status here.
       setProgress(95);
@@ -620,10 +569,10 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
       await supabase
         .from('broadcasts')
         .update({ status: finalStatus })
-        .eq('id', broadcast.id);
+        .eq('id', broadcastId);
 
       setProgress(100);
-      return broadcast.id;
+      return broadcastId;
     } finally {
       setIsProcessing(false);
     }
