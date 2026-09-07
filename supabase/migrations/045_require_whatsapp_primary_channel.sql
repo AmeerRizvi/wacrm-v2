@@ -44,7 +44,7 @@ $$;
 
 DROP TRIGGER IF EXISTS require_whatsapp_primary_channel ON whatsapp_config;
 CREATE CONSTRAINT TRIGGER require_whatsapp_primary_channel
-  AFTER INSERT OR UPDATE OF is_primary OR DELETE
+  AFTER INSERT OR UPDATE OR DELETE
   ON whatsapp_config
   DEFERRABLE INITIALLY DEFERRED
   FOR EACH ROW EXECUTE FUNCTION public.require_whatsapp_primary_channel();
