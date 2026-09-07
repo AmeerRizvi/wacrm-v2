@@ -444,7 +444,7 @@ async function advanceFromNodeKey(
       return { outcome: "completed" };
     }
 
-    const node = nodes.get(currentKey) ?? null;
+    const node: FlowNodeRow | null = nodes.get(currentKey) ?? null;
     if (!node) {
       await logEvent(db, run.id, "error", currentKey, { reason: "node_not_found" });
       await endRun(db, run.id, "failed", "node_not_found");

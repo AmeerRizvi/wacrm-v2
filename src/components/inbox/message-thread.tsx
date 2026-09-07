@@ -473,6 +473,7 @@ export function MessageThread({
       const optimisticMsg: Message = {
         id: tempId,
         conversation_id: conversation.id,
+        whatsapp_config_id: conversation.whatsapp_config_id,
         sender_type: "agent",
         content_type: "text",
         content_text: text,
@@ -536,6 +537,7 @@ export function MessageThread({
       const optimisticMsg: Message = {
         id: tempId,
         conversation_id: conversation.id,
+        whatsapp_config_id: conversation.whatsapp_config_id,
         sender_type: "agent",
         content_type: payload.kind,
         content_text: contentText,
@@ -596,6 +598,7 @@ export function MessageThread({
       const optimisticMsg: Message = {
         id: tempId,
         conversation_id: conversation.id,
+        whatsapp_config_id: conversation.whatsapp_config_id,
         sender_type: "agent",
         content_type: "interactive",
         content_text: payload.body,
@@ -675,6 +678,7 @@ export function MessageThread({
       const optimisticMsg: Message = {
         id: tempId,
         conversation_id: conversation.id,
+        whatsapp_config_id: conversation.whatsapp_config_id,
         sender_type: "agent",
         content_type: "template",
         content_text: renderedBody,

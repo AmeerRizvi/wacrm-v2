@@ -6,6 +6,8 @@ function row(overrides: Partial<MessageTemplate> = {}): MessageTemplate {
   return {
     id: 'row-1',
     user_id: 'user-1',
+    account_id: 'account-1',
+    whatsapp_config_id: null,
     name: 'order_confirmation',
     category: 'Utility',
     language: 'en_US',

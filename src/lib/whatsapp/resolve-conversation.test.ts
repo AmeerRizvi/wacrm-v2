@@ -42,6 +42,7 @@ function makeDb(script: Script): SupabaseClient {
       return builder;
     },
     eq: () => builder,
+    is: () => builder,
     order: () => builder,
     limit: () => {
       if (table === 'conversations' && mode === 'select') {
@@ -189,7 +190,7 @@ describe('resolveConversationByPhone', () => {
     const db = makeDb({
       config: { id: 'wa-1' },
       contactCandidates: [{ id: 'c1', phone: '14155550123' }],
-      existingConversationByCall: [null, { id: 'cv-raced' }],
+      existingConversationByCall: [null, null, { id: 'cv-raced' }],
       insertConversationError: { code: '23505' },
     });
     const res = await resolveConversationByPhone(db, 'acct', '+14155550123');
