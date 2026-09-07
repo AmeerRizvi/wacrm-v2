@@ -131,7 +131,9 @@ export async function POST(request: Request) {
       }
     } else {
       // No local template row exists yet (for example a legacy install before
-      // first sync), so preserve the historical primary-channel fallback.
+      // first sync), so preserve the historical primary-channel lookup. The
+      // template validation below still refuses to send until the selected
+      // channel's local catalog has been synced and the row is APPROVED.
       const result = await supabase
         .from('whatsapp_config')
         .select('id,phone_number_id,access_token')
@@ -165,16 +167,31 @@ export async function POST(request: Request) {
         { status: 500 },
       )
     }
+    if (!resolvedTemplate.row) {
+      return NextResponse.json(
+        { error: 'Template is not synced on the selected WhatsApp channel.' },
+        { status: 400 },
+      )
+    }
+    if (resolvedTemplate.row.status !== 'APPROVED') {
+      return NextResponse.json(
+        {
+          error: `Template is ${resolvedTemplate.row.status} on the selected WhatsApp channel. Sync/resolve it before broadcasting.`,
+        },
+        { status: 409 },
+      )
+    }
 
     const results: BroadcastResult[] = []
     let sentCount = 0
     let failedCount = 0
 
     for (const recipient of recipients) {
-      const sanitized = sanitizePhoneForMeta(recipient.phone)
+      const rawPhone = typeof recipient?.phone === 'string' ? recipient.phone : ''
+      const sanitized = sanitizePhoneForMeta(rawPhone)
       if (!isValidE164(sanitized)) {
         results.push({
-          phone: recipient.phone,
+          phone: rawPhone,
           status: 'failed',
           error: 'Invalid phone number format',
         })
@@ -192,9 +209,11 @@ export async function POST(request: Request) {
             to: variant,
             templateName: template_name,
             language: resolvedTemplate.language,
-            template: resolvedTemplate.row ?? undefined,
+            template: resolvedTemplate.row,
             messageParams: recipient.messageParams,
-            params: recipient.params ?? [],
+            params: Array.isArray(recipient.params)
+              ? recipient.params.filter((value): value is string => typeof value === 'string')
+              : [],
           })
           sentMessageId = result.messageId
           lastError = null
@@ -208,14 +227,14 @@ export async function POST(request: Request) {
 
       if (sentMessageId) {
         results.push({
-          phone: recipient.phone,
+          phone: rawPhone,
           status: 'sent',
           whatsapp_message_id: sentMessageId,
         })
         sentCount++
       } else {
         results.push({
-          phone: recipient.phone,
+          phone: rawPhone,
           status: 'failed',
           error: lastError || 'Unknown error',
         })
