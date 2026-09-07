@@ -42,6 +42,11 @@ BEGIN
 
   IF NOT EXISTS (
     SELECT 1 FROM information_schema.columns
+    WHERE table_schema='public' AND table_name='broadcasts' AND column_name='template_message_params'
+  ) THEN RAISE EXCEPTION 'broadcasts.template_message_params is missing — migration 050 did not apply'; END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
     WHERE table_schema='public' AND table_name='message_templates' AND column_name='whatsapp_config_id'
   ) THEN RAISE EXCEPTION 'message_templates.whatsapp_config_id is missing'; END IF;
 
@@ -65,14 +70,24 @@ BEGIN
   END IF;
 
   IF to_regprocedure(
-    'public.create_broadcast_with_recipients(uuid,uuid,text,text,text,integer,uuid[],jsonb[],uuid)'
+    'public.create_broadcast_with_recipients(uuid,uuid,text,text,text,integer,uuid[],jsonb[],uuid,jsonb)'
   ) IS NULL THEN
-    RAISE EXCEPTION 'channel-aware atomic broadcast creation RPC is missing';
+    RAISE EXCEPTION 'canonical channel-aware atomic broadcast creation RPC is missing';
   END IF;
   IF pg_get_functiondef(
-    to_regprocedure('public.create_broadcast_with_recipients(uuid,uuid,text,text,text,integer,uuid[],jsonb[],uuid)')
+    to_regprocedure('public.create_broadcast_with_recipients(uuid,uuid,text,text,text,integer,uuid[],jsonb[],uuid,jsonb)')
   ) NOT ILIKE '%mt.status = ''APPROVED''%' THEN
     RAISE EXCEPTION 'broadcast creation RPC does not require an APPROVED template';
+  END IF;
+  IF pg_get_functiondef(
+    to_regprocedure('public.create_broadcast_with_recipients(uuid,uuid,text,text,text,integer,uuid[],jsonb[],uuid,jsonb)')
+  ) NOT ILIKE '%template_message_params%' THEN
+    RAISE EXCEPTION 'broadcast creation RPC does not persist structured send-time template params';
+  END IF;
+  IF to_regprocedure(
+    'public.create_broadcast_with_recipients(uuid,uuid,text,text,text,integer,uuid[],jsonb[],uuid)'
+  ) IS NOT NULL THEN
+    RAISE EXCEPTION 'legacy 9-argument broadcast RPC still exists — migration 050 did not replace it';
   END IF;
   IF to_regprocedure(
     'public.create_broadcast_with_recipients(uuid,uuid,text,text,text,integer,uuid[],jsonb[])'
