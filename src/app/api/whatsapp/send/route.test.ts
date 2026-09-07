@@ -14,20 +14,46 @@ const h = vi.hoisted(() => ({
       id: 'conv-1',
       whatsapp_config_id: 'cfg-sales',
     } as Record<string, unknown> | null,
+    channel: { id: 'cfg-support' } as Record<string, unknown> | null,
+    bindError: null as { code?: string; message?: string } | null,
   },
 }))
 
 function makeSupabase() {
   return {
     from(table: string) {
-      const builder: Record<string, unknown> = {
+      let operation: 'read' | 'update' = 'read'
+      let updateValues: Record<string, unknown> | null = null
+      const builder: Record<string, any> = {
         select: () => builder,
+        update: (values: Record<string, unknown>) => {
+          operation = 'update'
+          updateValues = values
+          return builder
+        },
         eq: () => builder,
+        is: () => builder,
         maybeSingle: async () => {
           if (table === 'contacts') {
             return { data: h.state.contact, error: null }
           }
+          if (table === 'whatsapp_config') {
+            return { data: h.state.channel, error: null }
+          }
           if (table === 'conversations') {
+            if (operation === 'update') {
+              if (h.state.bindError) {
+                return { data: null, error: h.state.bindError }
+              }
+              if (!h.state.conversation || h.state.conversation.whatsapp_config_id) {
+                return { data: null, error: null }
+              }
+              h.state.conversation = {
+                ...h.state.conversation,
+                whatsapp_config_id: updateValues?.whatsapp_config_id ?? null,
+              }
+              return { data: h.state.conversation, error: null }
+            }
             return { data: h.state.conversation, error: null }
           }
           throw new Error(`unexpected table: ${table}`)
@@ -107,6 +133,8 @@ beforeEach(() => {
     id: 'conv-1',
     whatsapp_config_id: 'cfg-sales',
   }
+  h.state.channel = { id: 'cfg-support' }
+  h.state.bindError = null
   h.resolveConversationByPhone.mockResolvedValue({
     conversationId: 'conv-primary',
     contactId: 'contact-1',
@@ -226,6 +254,72 @@ describe('POST /api/whatsapp/send — existing conversation routing', () => {
 
     expect(res.status).toBe(409)
     expect(json.error).toMatch(/does not match/i)
+    expect(h.sendMessageToConversation).not.toHaveBeenCalled()
+  })
+
+  it('binds a legacy NULL-channel conversation to an explicitly requested channel before sending', async () => {
+    h.state.conversation = {
+      id: 'conv-legacy',
+      whatsapp_config_id: null,
+    }
+
+    const res = await POST(
+      request({
+        conversation_id: 'conv-legacy',
+        channel_id: 'cfg-support',
+        message_type: 'text',
+        content_text: 'hello',
+      }),
+    )
+    const json = await res.json()
+
+    expect(res.status).toBe(200)
+    expect(h.state.conversation?.whatsapp_config_id).toBe('cfg-support')
+    expect(json.channel_id).toBe('cfg-support')
+    expect(h.sendMessageToConversation).toHaveBeenCalledWith(
+      expect.anything(),
+      'acct-1',
+      expect.objectContaining({ conversationId: 'conv-legacy' }),
+    )
+  })
+
+  it('refuses to bind a legacy conversation to a channel outside the account', async () => {
+    h.state.conversation = {
+      id: 'conv-legacy',
+      whatsapp_config_id: null,
+    }
+    h.state.channel = null
+
+    const res = await POST(
+      request({
+        conversation_id: 'conv-legacy',
+        channel_id: 'cfg-other-account',
+        message_type: 'text',
+        content_text: 'hello',
+      }),
+    )
+
+    expect(res.status).toBe(404)
+    expect(h.sendMessageToConversation).not.toHaveBeenCalled()
+  })
+
+  it('fails before sending when legacy binding collides with an existing channel thread', async () => {
+    h.state.conversation = {
+      id: 'conv-legacy',
+      whatsapp_config_id: null,
+    }
+    h.state.bindError = { code: '23505', message: 'duplicate key' }
+
+    const res = await POST(
+      request({
+        conversation_id: 'conv-legacy',
+        channel_id: 'cfg-support',
+        message_type: 'text',
+        content_text: 'hello',
+      }),
+    )
+
+    expect(res.status).toBe(409)
     expect(h.sendMessageToConversation).not.toHaveBeenCalled()
   })
 
