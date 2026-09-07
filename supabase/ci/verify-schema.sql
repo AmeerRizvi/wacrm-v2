@@ -100,6 +100,9 @@ BEGIN
     SELECT 1 FROM pg_trigger
     WHERE tgname = 'maintain_whatsapp_primary_channel' AND NOT tgisinternal
   ) THEN RAISE EXCEPTION 'transactional primary-channel trigger is missing'; END IF;
+  IF pg_get_functiondef(to_regprocedure('public.maintain_whatsapp_primary_channel()')) NOT ILIKE '%pg_try_advisory_xact_lock%' THEN
+    RAISE EXCEPTION 'primary-channel mutation function is missing fail-fast advisory locking';
+  END IF;
 
   IF NOT EXISTS (
     SELECT 1
@@ -115,7 +118,10 @@ BEGIN
   IF NOT EXISTS (
     SELECT 1 FROM pg_trigger
     WHERE tgname = 'lock_whatsapp_channel_before_delete' AND NOT tgisinternal
-  ) THEN RAISE EXCEPTION 'primary-channel delete lock-order trigger is missing'; END IF;
+  ) THEN RAISE EXCEPTION 'primary-channel delete lock trigger is missing'; END IF;
+  IF pg_get_functiondef(to_regprocedure('public.lock_whatsapp_channel_before_delete()')) NOT ILIKE '%pg_try_advisory_xact_lock%' THEN
+    RAISE EXCEPTION 'channel delete function is missing fail-fast advisory locking';
+  END IF;
 
   IF NOT EXISTS (
     SELECT 1 FROM pg_trigger
