@@ -59,6 +59,13 @@ export async function POST(request: Request) {
       throw err
     }
 
+    const requestedChannel =
+      typeof whatsappConfigId === 'string' && whatsappConfigId
+        ? whatsappConfigId
+        : typeof channelId === 'string' && channelId
+          ? channelId
+          : null
+
     let conversationId: string
     let resolvedChannelId: string | null = null
 
@@ -75,21 +82,86 @@ export async function POST(request: Request) {
       conversationId = data.id
       resolvedChannelId = data.whatsapp_config_id ?? null
 
-      const requestedChannel =
-        typeof whatsappConfigId === 'string' && whatsappConfigId
-          ? whatsappConfigId
-          : typeof channelId === 'string' && channelId
-            ? channelId
-            : null
-      if (
-        requestedChannel &&
-        resolvedChannelId &&
-        requestedChannel !== resolvedChannelId
-      ) {
+      if (requestedChannel && resolvedChannelId && requestedChannel !== resolvedChannelId) {
         return NextResponse.json(
           { error: 'channel_id does not match the conversation WhatsApp channel' },
           { status: 409 },
         )
+      }
+
+      // Upgrade edge: a conversation created before WhatsApp was configured can
+      // still be NULL-bound. When the caller explicitly chooses a channel, that
+      // choice must win over the primary fallback used by the shared sender.
+      // Bind before the Meta send so historical messages are backfilled by the
+      // DB trigger and a uniqueness race fails before anything is transmitted.
+      if (requestedChannel && !resolvedChannelId) {
+        const { data: channel, error: channelError } = await supabase
+          .from('whatsapp_config')
+          .select('id')
+          .eq('account_id', accountId)
+          .eq('id', requestedChannel)
+          .maybeSingle()
+        if (channelError) {
+          return NextResponse.json({ error: 'Failed to resolve WhatsApp channel' }, { status: 500 })
+        }
+        if (!channel) {
+          return NextResponse.json({ error: 'WhatsApp channel not found' }, { status: 404 })
+        }
+
+        const { data: bound, error: bindError } = await supabase
+          .from('conversations')
+          .update({
+            whatsapp_config_id: requestedChannel,
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', conversationId)
+          .eq('account_id', accountId)
+          .is('whatsapp_config_id', null)
+          .select('id,whatsapp_config_id')
+          .maybeSingle()
+
+        if (bindError) {
+          if (bindError.code === '23505') {
+            return NextResponse.json(
+              {
+                error:
+                  'A channel-specific conversation already exists for this contact. Refresh the inbox and use that thread.',
+              },
+              { status: 409 },
+            )
+          }
+          return NextResponse.json(
+            { error: 'Failed to bind conversation to WhatsApp channel' },
+            { status: 500 },
+          )
+        }
+
+        if (!bound) {
+          // Another request may have bound the legacy row after our first read.
+          const { data: current, error: currentError } = await supabase
+            .from('conversations')
+            .select('whatsapp_config_id')
+            .eq('id', conversationId)
+            .eq('account_id', accountId)
+            .maybeSingle()
+          if (currentError || !current) {
+            return NextResponse.json(
+              { error: 'Failed to re-read conversation WhatsApp channel' },
+              { status: 500 },
+            )
+          }
+          if (current.whatsapp_config_id !== requestedChannel) {
+            return NextResponse.json(
+              {
+                error:
+                  'This conversation was assigned to another WhatsApp channel concurrently. Refresh the inbox before sending.',
+              },
+              { status: 409 },
+            )
+          }
+        }
+
+        resolvedChannelId = requestedChannel
       }
     } else {
       const { data: contact, error: contactError } = await supabase
@@ -101,13 +173,6 @@ export async function POST(request: Request) {
       if (contactError || !contact?.phone) {
         return NextResponse.json({ error: 'Contact not found' }, { status: 404 })
       }
-
-      const requestedChannel =
-        typeof whatsappConfigId === 'string' && whatsappConfigId
-          ? whatsappConfigId
-          : typeof channelId === 'string' && channelId
-            ? channelId
-            : null
 
       try {
         const resolved = await resolveConversationByPhone(
