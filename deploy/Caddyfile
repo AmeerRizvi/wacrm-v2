@@ -1,0 +1,3 @@
+wa.joyboy.work {
+    reverse_proxy 127.0.0.1:3100
+}

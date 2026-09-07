@@ -15,3 +15,6 @@ docker-compose*.yml
 .vscode
 .idea
 coverage
+
+# Deployment tooling is not application runtime code
+deploy

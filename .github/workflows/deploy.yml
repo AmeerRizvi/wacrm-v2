@@ -1,0 +1,65 @@
+name: Deploy production
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+concurrency:
+  group: wacrm-production
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 30
+    env:
+      NEXT_PUBLIC_SUPABASE_URL: ${{ vars.NEXT_PUBLIC_SUPABASE_URL }}
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ vars.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+      NEXT_PUBLIC_SITE_URL: https://wa.joyboy.work
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - name: Validate public build configuration
+        run: |
+          test -n "$NEXT_PUBLIC_SUPABASE_URL"
+          test -n "$NEXT_PUBLIC_SUPABASE_ANON_KEY"
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - name: Build production image
+        run: |
+          docker build --tag "wacrm:$GITHUB_SHA" \
+            --build-arg NEXT_PUBLIC_SUPABASE_URL \
+            --build-arg NEXT_PUBLIC_SUPABASE_ANON_KEY \
+            --build-arg NEXT_PUBLIC_SITE_URL .
+          docker save "wacrm:$GITHUB_SHA" | gzip > image.tar.gz
+      - name: Deploy over verified SSH
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$DEPLOY_SSH_KEY"
+          test -n "$DEPLOY_KNOWN_HOSTS"
+          [[ "$DEPLOY_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]]
+          [[ "$DEPLOY_USER" =~ ^[a-zA-Z_][a-zA-Z0-9_-]*$ ]]
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/wacrm
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/wacrm ~/.ssh/known_hosts
+          trap 'rm -f ~/.ssh/wacrm' EXIT
+          target="$DEPLOY_USER@$DEPLOY_HOST"
+          stage="/opt/wacrm/staging/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          ssh_opts=(-i ~/.ssh/wacrm -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=15)
+          ssh "${ssh_opts[@]}" "$target" "mkdir -p '$stage'"
+          scp "${ssh_opts[@]}" image.tar.gz deploy/compose.yml deploy/release.sh "$target:$stage/"
+          ssh "${ssh_opts[@]}" "$target" "cd '$stage' && gzip -dc image.tar.gz | docker load && bash release.sh 'wacrm:$GITHUB_SHA' && rm -f image.tar.gz"

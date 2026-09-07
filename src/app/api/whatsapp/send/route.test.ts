@@ -24,7 +24,7 @@ function makeSupabase() {
     from(table: string) {
       let operation: 'read' | 'update' = 'read'
       let updateValues: Record<string, unknown> | null = null
-      const builder: Record<string, any> = {
+      const builder: Record<string, unknown> = {
         select: () => builder,
         update: (values: Record<string, unknown>) => {
           operation = 'update'

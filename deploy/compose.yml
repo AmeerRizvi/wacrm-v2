@@ -1,0 +1,28 @@
+name: wacrm-production
+services:
+  app:
+    image: ${WACRM_IMAGE:?Set WACRM_IMAGE}
+    env_file: .env.production
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      HOSTNAME: 0.0.0.0
+      NEXT_PUBLIC_SITE_URL: https://wa.joyboy.work
+      WHATSAPP_TEMPLATES_DRY_RUN: 'false'
+    ports:
+      - '127.0.0.1:3100:3000'
+    restart: unless-stopped
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:3000/login',{signal:AbortSignal.timeout(4000),redirect:'manual'}).then(r=>process.exit(r.status===200?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
