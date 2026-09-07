@@ -192,6 +192,13 @@ export async function planBroadcastResume(
       400,
     );
   }
+  if (resolvedTemplate.row.status !== 'APPROVED') {
+    throw new BroadcastError(
+      'template_not_approved',
+      `Template is ${resolvedTemplate.row.status} on the WhatsApp channel used by this broadcast. Sync/resolve it before resuming.`,
+      409,
+    );
+  }
 
   const plan: BroadcastPlan = {
     broadcastId,
