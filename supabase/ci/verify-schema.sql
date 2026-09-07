@@ -73,9 +73,15 @@ BEGIN
   ) THEN RAISE EXCEPTION 'WABA tenant ownership trigger is missing'; END IF;
 
   IF NOT EXISTS (
-    SELECT 1 FROM pg_trigger
-    WHERE tgname = 'prevent_whatsapp_channel_identity_change' AND NOT tgisinternal
-  ) THEN RAISE EXCEPTION 'phone-number identity protection trigger is missing'; END IF;
+    SELECT 1
+    FROM pg_trigger
+    WHERE tgname = 'prevent_whatsapp_channel_identity_change'
+      AND NOT tgisinternal
+      AND pg_get_triggerdef(oid) ILIKE '%phone_number_id%'
+      AND pg_get_triggerdef(oid) ILIKE '%account_id%'
+  ) THEN
+    RAISE EXCEPTION 'WhatsApp channel phone/account identity protection trigger is missing or incomplete';
+  END IF;
 
   IF NOT EXISTS (
     SELECT 1 FROM pg_trigger
