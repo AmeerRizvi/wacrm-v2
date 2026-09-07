@@ -21,6 +21,7 @@ vi.mock('@/lib/whatsapp/template-body', () => ({
       language: 'en_US',
       category: 'Utility',
       body_text: 'Your order {{1}} ships on {{2}}',
+      status: 'APPROVED',
       created_at: '2026-01-01T00:00:00Z',
     },
     language: 'en_US',
