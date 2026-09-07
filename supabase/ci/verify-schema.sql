@@ -54,6 +54,9 @@ BEGIN
   IF to_regclass('public.message_templates_channel_name_language_key') IS NULL THEN
     RAISE EXCEPTION 'channel-scoped template uniqueness index is missing';
   END IF;
+  IF to_regclass('public.message_templates_user_name_language_key') IS NOT NULL THEN
+    RAISE EXCEPTION 'legacy per-user template unique index still exists — migration 046 did not apply';
+  END IF;
   IF to_regclass('public.idx_one_active_run_per_conversation') IS NULL THEN
     RAISE EXCEPTION 'conversation-scoped active Flow uniqueness index is missing';
   END IF;
@@ -87,6 +90,17 @@ BEGIN
     SELECT 1 FROM pg_trigger
     WHERE tgname = 'maintain_whatsapp_primary_channel' AND NOT tgisinternal
   ) THEN RAISE EXCEPTION 'transactional primary-channel trigger is missing'; END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_trigger
+    WHERE tgname = 'require_whatsapp_primary_channel'
+      AND NOT tgisinternal
+      AND tgdeferrable
+      AND tginitdeferred
+  ) THEN
+    RAISE EXCEPTION 'deferred at-least-one-primary WhatsApp channel invariant is missing';
+  END IF;
 
   IF NOT EXISTS (
     SELECT 1 FROM pg_trigger
