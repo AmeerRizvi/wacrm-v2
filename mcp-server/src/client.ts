@@ -152,6 +152,7 @@ export class WacrmClient {
     cursor?: string;
     status?: string;
     contact_id?: string;
+    channel_id?: string;
   }): Promise<Paginated<unknown>> {
     return this.list('/conversations', query);
   }
