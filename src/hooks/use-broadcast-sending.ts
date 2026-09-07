@@ -51,8 +51,8 @@ interface BroadcastPayload {
   /**
    * Media URL for an IMAGE/VIDEO/DOCUMENT header. Required at send
    * time for media-header templates — Meta rejects the send without
-   * it. Passed through as `messageParams.headerMediaUrl`; the builder
-   * falls back to the template's stored URL only when this is empty.
+   * it. This is campaign-specific and is persisted before delivery so
+   * Resume/Retry cannot silently fall back to another media asset.
    */
   headerMediaUrl?: string;
 }
@@ -396,6 +396,15 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
         ]),
       );
 
+      const headerType = payload.template.header_type;
+      const isMediaHeader =
+        headerType === 'image' ||
+        headerType === 'video' ||
+        headerType === 'document';
+      const headerMediaUrl = payload.headerMediaUrl?.trim();
+      const requestedMessageParams =
+        isMediaHeader && headerMediaUrl ? { headerMediaUrl } : {};
+
       // ── Step 2: Atomically create parent + every recipient ─────────
       setProgress(20);
       const createRes = await fetch('/api/whatsapp/broadcast/create', {
@@ -410,6 +419,7 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
           template_params: contacts.map(
             (contact) => paramsByContact.get(contact.id) ?? [],
           ),
+          template_message_params: requestedMessageParams,
           template_variables: payload.variables,
           audience_filter: {
             type: payload.audience.type,
@@ -424,6 +434,12 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
         throw new Error(created.error || 'Failed to create broadcast');
       }
       const broadcastId = created.broadcast_id as string;
+      const persistedMessageParams =
+        created.template_message_params &&
+        typeof created.template_message_params === 'object' &&
+        !Array.isArray(created.template_message_params)
+          ? created.template_message_params
+          : {};
 
       // ── Step 3: Fetch the atomically-created plan with contacts ────
       setProgress(30);
@@ -439,19 +455,6 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
       let failedCount = 0;
       const totalRecipients = recipients.length;
 
-      // Media-header templates (image/video/document) require a media
-      // URL on every send. Collected in the personalize step and applied
-      // to all recipients; falls back to the template's stored URL on the
-      // server when omitted.
-      const headerType = payload.template.header_type;
-      const isMediaHeader =
-        headerType === 'image' ||
-        headerType === 'video' ||
-        headerType === 'document';
-      const headerMediaUrl = payload.headerMediaUrl?.trim();
-      const messageParams =
-        isMediaHeader && headerMediaUrl ? { headerMediaUrl } : undefined;
-
       for (let i = 0; i < recipients.length; i += SEND_BATCH_SIZE) {
         const batch = recipients.slice(i, i + SEND_BATCH_SIZE);
 
@@ -459,10 +462,11 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
           .filter((r) => r.contact?.phone)
           .map((r) => ({
             phone: r.contact!.phone as string,
-            // Read back off the row rather than re-resolved, so this
-            // pass and any later resume send identical params.
+            // Both body params and structured values come from the values that
+            // were persisted before delivery. Initial fan-out and Resume/Retry
+            // therefore reconstruct the same Meta template payload.
             params: Array.isArray(r.template_params) ? r.template_params : [],
-            ...(messageParams ? { messageParams } : {}),
+            messageParams: persistedMessageParams,
           }));
 
         if (apiRecipients.length === 0) continue;
