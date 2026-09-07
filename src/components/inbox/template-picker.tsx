@@ -35,6 +35,11 @@ interface TemplatePickerProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onSelect: (template: MessageTemplate, values: TemplateSendValues) => void;
+  /**
+   * Explicit WhatsApp channel for non-Inbox callers such as Contact Detail.
+   * When omitted, the picker resolves the active Inbox conversation channel.
+   */
+  channelId?: string | null;
 }
 
 function renderBodyPreview(body: string, params: string[]): string {
@@ -74,6 +79,7 @@ export function TemplatePicker({
   open,
   onOpenChange,
   onSelect,
+  channelId,
 }: TemplatePickerProps) {
   const t = useTranslations("Inbox.templatePicker");
   const conversationId = useActiveConversationId();
@@ -96,7 +102,7 @@ export function TemplatePicker({
         data: { user },
       } = await supabase.auth.getUser();
 
-      if (!user || !conversationId) {
+      if (!user) {
         if (!cancelled) {
           setTemplates([]);
           setLoading(false);
@@ -104,19 +110,30 @@ export function TemplatePicker({
         return;
       }
 
-      const { data: conversation, error: conversationError } = await supabase
-        .from("conversations")
-        .select("whatsapp_config_id")
-        .eq("id", conversationId)
-        .maybeSingle();
+      let resolvedChannelId = channelId?.trim() || null;
 
-      if (cancelled) return;
-      if (conversationError || !conversation?.whatsapp_config_id) {
+      // Inbox callers don't need to pass a prop: the active conversation is
+      // authoritative. Non-Inbox callers MUST provide channelId so they do
+      // not silently fall back to whatever number happens to be primary.
+      if (!resolvedChannelId && conversationId) {
+        const { data: conversation, error: conversationError } = await supabase
+          .from("conversations")
+          .select("whatsapp_config_id")
+          .eq("id", conversationId)
+          .maybeSingle();
+
+        if (cancelled) return;
         if (conversationError) {
           console.error("Failed to resolve conversation channel:", conversationError);
         }
-        setTemplates([]);
-        setLoading(false);
+        resolvedChannelId = conversation?.whatsapp_config_id ?? null;
+      }
+
+      if (!resolvedChannelId) {
+        if (!cancelled) {
+          setTemplates([]);
+          setLoading(false);
+        }
         return;
       }
 
@@ -124,7 +141,7 @@ export function TemplatePicker({
         .from("message_templates")
         .select("*")
         .eq("status", "APPROVED")
-        .eq("whatsapp_config_id", conversation.whatsapp_config_id)
+        .eq("whatsapp_config_id", resolvedChannelId)
         .order("created_at", { ascending: false });
 
       if (cancelled) return;
@@ -140,7 +157,7 @@ export function TemplatePicker({
     return () => {
       cancelled = true;
     };
-  }, [open, conversationId]);
+  }, [open, conversationId, channelId]);
 
   function resetSelection() {
     setSelected(null);
@@ -220,7 +237,7 @@ export function TemplatePicker({
               <div className="rounded-md border border-border bg-background/50 p-6 text-center">
                 <p className="text-sm text-popover-foreground">{t("noApprovedTemplates")}</p>
                 <p className="mt-1 text-xs text-muted-foreground">
-                  No approved templates are synced for this conversation&apos;s WhatsApp number.
+                  No approved templates are synced for this WhatsApp number.
                 </p>
               </div>
             ) : (
