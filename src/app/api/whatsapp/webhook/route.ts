@@ -1,3 +1,4 @@
+import { notifyIncomingMessage } from '@/lib/push/send'
 import { NextResponse, after } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
 import { decrypt, encrypt, isLegacyFormat } from '@/lib/whatsapp/encryption'
@@ -481,6 +482,8 @@ async function processMessage(
     return
   }
   if (!insertedRows?.length) return
+
+  await notifyIncomingMessage(accountId, conversation.id, insertedRows[0].id).catch(() => console.warn('[push] incoming notification failed'))
 
   const { error: convError } = await supabaseAdmin().rpc('bump_conversation_on_inbound', {
     p_conversation_id: conversation.id,
