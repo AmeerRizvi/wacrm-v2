@@ -1,9 +1,10 @@
 // ============================================================
 // Broadcast resume / retry (issue #472).
 //
-// A resumed campaign must use the exact WhatsApp channel stored on the
-// broadcast. Changing the workspace primary after a campaign was created must
-// never change the number used by Retry/Resume.
+// A resumed campaign must use the exact WhatsApp channel and send-time template
+// values stored on the broadcast. Changing the workspace primary, template
+// sample media, or local campaign form after creation must never change what a
+// Retry/Resume sends.
 // ============================================================
 
 import type { SupabaseClient } from '@supabase/supabase-js';
@@ -12,6 +13,7 @@ import { BroadcastError, type BroadcastPlan } from '@/lib/whatsapp/broadcast-cor
 import { decrypt } from '@/lib/whatsapp/encryption';
 import { resolveTemplateRow } from '@/lib/whatsapp/template-body';
 import { sanitizePhoneForMeta, isValidE164 } from '@/lib/whatsapp/phone-utils';
+import type { SendTimeParams } from '@/lib/whatsapp/template-send-builder';
 
 export type ResumeScope = 'pending' | 'failed' | 'all';
 
@@ -28,6 +30,34 @@ function scopeStatuses(scope: ResumeScope): string[] {
   if (scope === 'pending') return ['pending'];
   if (scope === 'failed') return ['failed'];
   return ['pending', 'failed'];
+}
+
+function storedTemplateMessageParams(raw: unknown): SendTimeParams | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const input = raw as Record<string, unknown>;
+  const out: SendTimeParams = {};
+
+  if (typeof input.headerMediaUrl === 'string' && input.headerMediaUrl.trim()) {
+    out.headerMediaUrl = input.headerMediaUrl.trim();
+  }
+  if (typeof input.headerMediaId === 'string' && input.headerMediaId.trim()) {
+    out.headerMediaId = input.headerMediaId.trim();
+  }
+  if (typeof input.headerText === 'string' && input.headerText.trim()) {
+    out.headerText = input.headerText;
+  }
+  if (input.buttonParams && typeof input.buttonParams === 'object' && !Array.isArray(input.buttonParams)) {
+    const buttonParams: Record<number, string> = {};
+    for (const [key, value] of Object.entries(input.buttonParams as Record<string, unknown>)) {
+      const index = Number(key);
+      if (Number.isInteger(index) && index >= 0 && typeof value === 'string') {
+        buttonParams[index] = value;
+      }
+    }
+    if (Object.keys(buttonParams).length > 0) out.buttonParams = buttonParams;
+  }
+
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 export async function claimBroadcastDelivery(
@@ -94,7 +124,7 @@ export async function planBroadcastResume(
 ): Promise<ResumePlan> {
   const { data: broadcast, error: bcError } = await db
     .from('broadcasts')
-    .select('id, template_name, template_language, whatsapp_config_id')
+    .select('id, template_name, template_language, whatsapp_config_id, template_message_params')
     .eq('id', broadcastId)
     .eq('account_id', accountId)
     .maybeSingle();
@@ -111,6 +141,9 @@ export async function planBroadcastResume(
   }
 
   const channelId = broadcast.whatsapp_config_id as string;
+  const templateMessageParams = storedTemplateMessageParams(
+    broadcast.template_message_params,
+  );
   const statuses = scopeStatuses(scope);
   const { data: rawRows, error: recError } = await db
     .from('broadcast_recipients')
@@ -214,6 +247,7 @@ export async function planBroadcastResume(
       params: Array.isArray(row.template_params)
         ? row.template_params.filter((p): p is string => typeof p === 'string')
         : [],
+      messageParams: templateMessageParams,
     })),
     rejected: 0,
   };
