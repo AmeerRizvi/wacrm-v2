@@ -5,7 +5,7 @@ vi.mock('@/lib/flows/admin-client', () => ({ supabaseAdmin: db }))
 vi.mock('@/lib/push/send', () => ({ pushConfigured: () => true, sendPush: send }))
 import { POST } from './route'
 import { __resetRateLimitForTests } from '@/lib/rate-limit'
-beforeEach(() => { auth.mockReset(); db.mockReset(); send.mockReset(); __resetRateLimitForTests(); auth.mockResolvedValue({ userId: 'u', accountId: 'a' }) })
+beforeEach(() => { vi.stubEnv('NEXT_PUBLIC_SITE_URL', 'https://wa.joyboy.work'); auth.mockReset(); db.mockReset(); send.mockReset(); __resetRateLimitForTests(); auth.mockResolvedValue({ userId: 'u', accountId: 'a' }) })
 function request(action: string, origin = 'https://wa.joyboy.work') {
   return new Request('https://wa.joyboy.work/api/push', { method: 'POST', headers: { origin }, body: JSON.stringify({ action, endpoint: 'https://web.push.apple.com/device' }) })
 }
@@ -26,4 +26,21 @@ it('scopes device tests to both the authenticated user and account', async () =>
   expect(chain.eq).toHaveBeenCalledWith('user_id', 'u')
   expect(chain.eq).toHaveBeenCalledWith('account_id', 'a')
   expect(send).not.toHaveBeenCalled()
+})
+
+it('accepts the configured HTTPS origin behind an HTTP reverse proxy', async () => {
+  const response = await POST(new Request('http://localhost:3000/api/push', {
+    method: 'POST', headers: { origin: 'https://wa.joyboy.work' }, body: '{}',
+  }))
+  expect(response.status).toBe(400)
+  expect(await response.json()).toEqual({ error: 'Invalid push endpoint' })
+})
+it('does not trust a spoofed forwarded host or the internal origin', async () => {
+  const response = await POST(new Request('http://localhost:3000/api/push', {
+    method: 'POST', headers: { origin: 'https://evil.com', 'x-forwarded-host': 'evil.com', 'x-forwarded-proto': 'https' }, body: '{}',
+  }))
+  expect(response.status).toBe(403)
+})
+it('rejects missing origins', async () => {
+  expect((await POST(new Request('http://localhost:3000/api/push', { method: 'POST', body: '{}' }))).status).toBe(403)
 })

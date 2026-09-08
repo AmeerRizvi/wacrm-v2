@@ -14,7 +14,10 @@ export async function GET() {
 export async function POST(request: Request) {
   try {
     const { userId, accountId } = await getCurrentAccount()
-    if (request.headers.get('origin') !== new URL(request.url).origin) return NextResponse.json({ error: 'Invalid origin' }, { status: 403 })
+    // Caddy terminates HTTPS; the request URL can contain the internal HTTP origin.
+    // Trust the configured public URL, never caller-supplied forwarding headers.
+    const expectedOrigin = new URL(process.env.NEXT_PUBLIC_SITE_URL || request.url).origin
+    if (request.headers.get('origin') !== expectedOrigin) return NextResponse.json({ error: 'Invalid origin' }, { status: 403 })
     const limit = checkRateLimit(`push:${userId}`, { limit: 10, windowMs: 60000 })
     if (!limit.success) return rateLimitResponse(limit)
     const raw = await request.text()
